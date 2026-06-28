@@ -31,3 +31,4 @@ __pycache__/
 *.user
 Thumbs.db
 .DS_Store
+/manager/publish-sc

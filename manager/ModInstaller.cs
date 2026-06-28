@@ -60,7 +60,7 @@ public class ModInstaller(string gameDir)
             int eq = line.IndexOf('=');
             if (eq <= 0) continue;
             var key = line[..eq].Trim();
-            var val = line[(eq + 1)..].Trim();
+            var val = StripComment(line[(eq + 1)..]);
             if (d.ContainsKey(key)) d[key] = val is "1" or "true" or "True";
         }
         return d;
@@ -162,7 +162,7 @@ public class ModInstaller(string gameDir)
             int eq = line.IndexOf('=');
             if (eq <= 0) continue;
             if (line[..eq].Trim().Equals(key, StringComparison.OrdinalIgnoreCase))
-                return int.TryParse(line[(eq + 1)..].Trim(), out var n) ? n : def;
+                return int.TryParse(StripComment(line[(eq + 1)..]), out var n) ? n : def;
         }
         return def;
     }
@@ -181,7 +181,7 @@ public class ModInstaller(string gameDir)
             int eq = line.IndexOf('=');
             if (eq <= 0) continue;
             if (line[..eq].Trim().Equals(key, StringComparison.OrdinalIgnoreCase))
-                return double.TryParse(line[(eq + 1)..].Trim(), System.Globalization.CultureInfo.InvariantCulture, out var d) ? d : def;
+                return double.TryParse(StripComment(line[(eq + 1)..]), System.Globalization.CultureInfo.InvariantCulture, out var d) ? d : def;
         }
         return def;
     }
@@ -200,9 +200,18 @@ public class ModInstaller(string gameDir)
             int eq = line.IndexOf('=');
             if (eq <= 0) continue;
             if (line[..eq].Trim().Equals(key, StringComparison.OrdinalIgnoreCase))
-                return line[(eq + 1)..].Trim() is "1" or "true" or "True";
+                return StripComment(line[(eq + 1)..]) is "1" or "true" or "True";
         }
         return def;
+    }
+
+    /// <summary>Returns the ini value with any inline ";" comment stripped and trimmed.
+    /// The template (and thus the written ini) puts trailing comments on spell lines, so a raw
+    /// "1 ; Dash: ..." must be reduced to "1" before it is parsed.</summary>
+    static string StripComment(string rhs)
+    {
+        int sc = rhs.IndexOf(';');
+        return (sc >= 0 ? rhs[..sc] : rhs).Trim();
     }
 
     public void WriteIni(IDictionary<string, bool> pool, bool wispCurse, bool loop, bool forceWisp, int fairyMode, bool fairyStack, int fairyHeal,
