@@ -44,6 +44,13 @@ verify, which both wipe `openal32.dll`.
 
 Options are documented inline in `dll/vultramod.ini`.
 
+## WARNING
+
+Because Vagante is a compiled binary file, this uses DLL injection to make these changes. 
+Similar methods are used for a lot of cheat engines. 
+Do not use this while playing games that sense cheat engines and ban you, 
+such as Counter-Strike, League of Legends, Fortnite, etc.
+
 ## License
 
 Public domain, [The Unlicense](LICENSE). Do whatever you want with it.
