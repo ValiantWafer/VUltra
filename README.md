@@ -16,7 +16,7 @@ You set everything in `vultramod.ini`, either by hand or with the manager app.
 This repo only contains my own code. No game files, art, or symbols are in here.
 You need your own copy of Vagante.
 
-<img width="729" height="1720" alt="image" src="https://github.com/user-attachments/assets/b9a581e0-3f43-4e26-8ae2-810f6f162e47" />
+<img width="364" height="860" alt="image" src="https://github.com/user-attachments/assets/b9a581e0-3f43-4e26-8ae2-810f6f162e47" />
 
 ## Layout
 
