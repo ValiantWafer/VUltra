@@ -16,6 +16,8 @@ You set everything in `vultramod.ini`, either by hand or with the manager app.
 This repo only contains my own code. No game files, art, or symbols are in here.
 You need your own copy of Vagante.
 
+<img width="364" height="860" alt="image" src="https://github.com/user-attachments/assets/b9a581e0-3f43-4e26-8ae2-810f6f162e47" />
+
 ## Layout
 
 - `dll/` - the mod. `dllmain.cpp` is the whole thing. `proxy.def`, `exports.h`, and
@@ -43,6 +45,13 @@ By hand: back up `openal32.dll` as `openal32.orig.dll`, copy it to
 verify, which both wipe `openal32.dll`.
 
 Options are documented inline in `dll/vultramod.ini`.
+
+## WARNING
+
+Because Vagante is a compiled binary file, this uses DLL injection to make these changes. 
+Similar methods are used for a lot of cheat engines. 
+Do not use this while playing games that sense cheat engines and ban you, 
+such as Counter-Strike, League of Legends, Fortnite, etc.
 
 ## License
 
