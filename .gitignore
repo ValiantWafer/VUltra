@@ -1,0 +1,33 @@
+# ---------------------------------------------------------------------------
+# Local-only files, never published. Game data (copyrighted), reverse-
+# engineering dumps, and packaged release builds all live here. See README.
+# ---------------------------------------------------------------------------
+/_local/
+
+# --- .NET manager build output (regenerates in place) ---
+manager/bin/
+manager/obj/
+manager/publish/
+# embedded copy of the built proxy DLL (produced by the native build, then
+# embedded into the manager exe). Rebuild the dll, copy it here, build manager.
+manager/VUltra.dll
+
+# --- native proxy DLL build output (regenerates in place) ---
+dll/openal32.dll
+dll/openal32.lib
+dll/openal32.exp
+dll/*.obj
+dll/*.exp
+dll/*.lib
+dll/loadtest.exe
+dll/build.log
+
+# --- python tooling cache ---
+__pycache__/
+*.pyc
+
+# --- editor / OS noise ---
+.vs/
+*.user
+Thumbs.db
+.DS_Store
