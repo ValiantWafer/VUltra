@@ -39,6 +39,10 @@ Needs the MSVC x86 toolchain (VS 2019 BuildTools) and the .NET 9 SDK.
 
 Easiest is the manager app: it finds your Steam install and has an Install button.
 
+1. Download latest release and unzip it into its own folder
+2. Open VUltraManager.exe and click "Install" button at bottom
+3. Toggle any settings on and off, hit "Update Settings" (Some settings can be toggled while Vagante is open)
+
 By hand: back up `openal32.dll` as `openal32.orig.dll`, copy it to
 `openal32_real.dll`, then drop the built proxy in as `openal32.dll`. Put
 `vultramod.ini` next to `vagante.exe`. Redo this after a Steam update or a file
