@@ -912,15 +912,17 @@ static void load_config() {
     g_keepLobbyJoinable = cfg_int("multiplayer", "keep_lobby_joinable", 0, g_iniPath) != 0;       // applied at startup (host)
     g_portalCoop = cfg_int("multiplayer", "portal_coop", 1, g_iniPath) != 0;  // any player can use placed portals (both need the mod); live-toggleable
     g_portalTwoWay = cfg_int("multiplayer", "portal_two_way", 0, g_iniPath) != 0;  // interact on either portal end to teleport to the other; live-toggleable
-    g_wandSkillTree    = cfg_int("mage", "wand_skill_tree",    0, g_iniPath) != 0;  // applied at startup
-    g_randomWandWeapon = cfg_int("mage", "random_wand_weapon", 0, g_iniPath) != 0;  // applied at startup
-    g_wandZeroCharges  = cfg_int("mage", "wand_zero_charges",  0, g_iniPath) != 0;  // applied at startup
+    g_wandSkillTree    = cfg_int("mage", "wand_skill_tree",    0, g_iniPath) != 0;  // live: sync_mage_patches re-applies it to the next mage built
+    g_randomWandWeapon = cfg_int("mage", "random_wand_weapon", 0, g_iniPath) != 0;  // live: sync_mage_patches re-applies it to the next mage built
+    g_wandZeroCharges  = cfg_int("mage", "wand_zero_charges",  0, g_iniPath) != 0;  // live: sync_mage_patches re-applies it to the next mage built
     g_hostSync = GetPrivateProfileIntA("multiplayer", "host_settings_sync", 1, g_iniPath) != 0;  // never synced (local choice)
     rebuild_pool();
     ini_mtime(&g_iniMtime);
 }
 // Re-read the config (ini + any host overrides) and re-apply everything that can change live.
 // Caller holds g_cfgLock exclusively.
+static void host_publish_locked(const char* why);   // defined with the sync events below
+static void client_clear_overrides(const char* why);   // defined with the sync events below
 static void apply_config_now(const char* why) {
     load_config();
     apply_widening_if_needed();
@@ -928,16 +930,40 @@ static void apply_config_now(const char* why) {
     apply_random_tree_count();           // re-apply the Random-character skill-tree count
     logmsg("[vultra] config applied (%s); pool size %d, host overrides %s",
            why, g_poolN, g_cfgOvrActive ? "ON" : "off");
+    host_publish_locked(why);            // MP host: push the change to the lobby right away
+}
+// Event-driven ini reload: a background thread waits on a folder change notification and flags the
+// ini as possibly changed; the game thread then compares the file's timestamp. Other files in the
+// folder (like vultra.log) also wake it, but they don't change the ini's timestamp. If the watch
+// can't be set up, reload_if_ini_changed falls back to checking the timestamp every frame.
+static volatile LONG g_iniDirty = 1;     // set by ini_watch_thread on a folder change
+static volatile bool g_iniWatchOk = false;
+static DWORD WINAPI ini_watch_thread(LPVOID) {
+    char dir[MAX_PATH]; strcpy_s(dir, g_iniPath);
+    char* slash = strrchr(dir, '\\'); if (slash) *slash = 0;
+    HANDLE h = FindFirstChangeNotificationA(dir, FALSE, FILE_NOTIFY_CHANGE_LAST_WRITE | FILE_NOTIFY_CHANGE_FILE_NAME);
+    if (h == INVALID_HANDLE_VALUE) { logmsg("[vultra] ini watch failed; checking every frame"); return 0; }
+    g_iniWatchOk = true;
+    for (;;) {
+        if (WaitForSingleObject(h, INFINITE) != WAIT_OBJECT_0) break;
+        InterlockedExchange(&g_iniDirty, 1);
+        if (!FindNextChangeNotification(h)) break;
+    }
+    g_iniWatchOk = false;
+    FindCloseChangeNotification(h);
+    return 0;
 }
 // Live reload: if vultramod.ini changed on disk (e.g. the manager's "Save changes"),
 // re-read it so a running game picks up the new pool on the next spellbook it rolls.
 static void reload_if_ini_changed() {
+    if (g_iniWatchOk && InterlockedExchange(&g_iniDirty, 0) == 0) return;   // no change notification
     FILETIME t;
     if (!ini_mtime(&t)) return;
     if (t.dwLowDateTime == g_iniMtime.dwLowDateTime && t.dwHighDateTime == g_iniMtime.dwHighDateTime) return;
     AcquireSRWLockExclusive(&g_cfgLock);
     apply_config_now("ini changed");
     ReleaseSRWLockExclusive(&g_cfgLock);
+    if (!g_hostSync && g_cfgOvrActive) client_clear_overrides("sync turned off");   // client opted out
 }
 
 // ---- Host settings sync: Steam lobby glue --------------------------------
@@ -992,58 +1018,63 @@ static void* lobby_mm(uint64_t lobby) {
     return (m && g_sl.numMembers(m, lobby) > 0) ? m : nullptr;
 }
 
-// Host: publish version + settings once a second if they changed; log members' mod versions.
-static void host_sync_tick(void* server) {
-    static DWORD last = 0;
-    DWORD now = GetTickCount();
-    if (!server || now - last < 1000) return;
-    last = now;
-    uint64_t lobby = *reinterpret_cast<uint64_t*>(reinterpret_cast<uint8_t*>(server) + OFF_SERVER_LOBBY);
+// ---- Host settings sync: events ------------------------------------------
+// Everything here is driven by events, not timers:
+//   host   - publishes when its lobby is ready (Server::onSteamLobbyCreated / updateLobbyInformation)
+//            and whenever its settings are re-applied (apply_config_now, i.e. the ini changed).
+//   client - reads the host's settings once on join (Client::onSteamLobbyJoined), then again only
+//            when Steam reports the lobby data changed (LobbyDataUpdate_t callback). It drops the
+//            overrides on Client::disconnect.
+// Mid-game changes need nothing extra: every feature already reads its setting live, so a new value
+// takes effect the next time that code runs (next spellbook, next boss win, next floor, ...).
+static volatile uint64_t g_hostLobby = 0;          // lobby we host (from the Server)
+static volatile uint64_t g_hostPublishedLobby = 0; // lobby we last published to
+static volatile uint64_t g_clientLobby = 0;        // lobby we joined as a client
+
+// Host: write version + settings to the lobby if they changed. Caller holds g_cfgLock (any mode).
+static void host_publish_locked(const char* why) {
+    uint64_t lobby = g_hostLobby;
     void* m = lobby_mm(lobby);
     if (!m) return;
     static char lastCfg[4096] = {0};
-    static uint64_t lastLobby = 0;
     char cfg[4096] = {0};
     if (g_hostSync) {
         size_t len = 0;
-        AcquireSRWLockShared(&g_cfgLock);
         for (int i = 0; i < g_cfgSnapN; i++) {
             int w = sprintf_s(cfg + len, sizeof(cfg) - len, "%s%s=%s", len ? ";" : "", g_cfgSnap[i].key, g_cfgSnap[i].val);
             if (w < 0) break;
             len += (size_t)w;
         }
-        ReleaseSRWLockShared(&g_cfgLock);
     }
-    if (lobby != lastLobby || strcmp(cfg, lastCfg) != 0) {
-        g_sl.setData(m, lobby, "vultra_ver", VULTRA_VERSION);
-        g_sl.setData(m, lobby, "vultra_cfg", cfg);   // "" = host has sync turned off
-        logmsg("[sync] host published %s settings (%u bytes) to lobby %llx",
-               cfg[0] ? "its" : "NO", (unsigned)strlen(cfg), lobby);
-        strcpy_s(lastCfg, cfg);
-        lastLobby = lobby;
-    }
-    // Every 5 s, report who has the mod (logged on change). The host itself is the owner: skipped.
-    static DWORD lastScan = 0;
-    if (now - lastScan < 5000) return;
-    lastScan = now;
-    static struct { uint64_t id; char ver[24]; } seen[8];
-    static int seenN = 0;
-    uint64_t owner = g_sl.owner(m, lobby);
-    int n = g_sl.numMembers(m, lobby);
-    for (int i = 0; i < n && i < 8; i++) {
-        uint64_t id = g_sl.memberAt(m, lobby, i);
-        if (!id || id == owner) continue;
-        const char* v = g_sl.getMember(m, lobby, id, "vultra_ver");
-        char ver[24]; strncpy_s(ver, (v && *v) ? v : "none", _TRUNCATE);
-        int k = 0;
-        while (k < seenN && seen[k].id != id) k++;
-        if (k < seenN && strcmp(seen[k].ver, ver) == 0) continue;
-        if (k == seenN) { if (seenN >= 8) continue; seen[seenN].id = id; seenN++; }
-        strcpy_s(seen[k].ver, ver);
-        if (strcmp(ver, VULTRA_VERSION) == 0) logmsg("[sync] member %llx has VUltra %s (in sync)", id, ver);
-        else if (strcmp(ver, "none") == 0)    logmsg("[sync] member %llx does NOT have VUltra", id);
-        else logmsg("[sync] member %llx has VUltra %s, host has %s (NOT synced)", id, ver, VULTRA_VERSION);
-    }
+    if (lobby == g_hostPublishedLobby && strcmp(cfg, lastCfg) == 0) return;   // nothing new
+    if (!g_sl.setData(m, lobby, "vultra_ver", VULTRA_VERSION)) return;     // not the owner (yet)
+    g_sl.setData(m, lobby, "vultra_cfg", cfg);                              // "" = host turned sync off
+    strcpy_s(lastCfg, cfg);
+    g_hostPublishedLobby = lobby;
+    logmsg("[sync] host published %s settings (%u bytes) to lobby %llx (%s)",
+           cfg[0] ? "its" : "NO", (unsigned)strlen(cfg), lobby, why);
+}
+static void client_clear_overrides(const char* why);
+// Host: the Server's lobby exists or changed. Called after the game updates its lobby info.
+static void host_on_lobby(void* server) {
+    if (!server) return;
+    uint64_t lobby = *reinterpret_cast<uint64_t*>(reinterpret_cast<uint8_t*>(server) + OFF_SERVER_LOBBY);
+    if (!lobby || (lobby == g_hostLobby && lobby == g_hostPublishedLobby)) return;   // already done
+    g_hostLobby = lobby;
+    if (g_clientLobby == lobby) g_clientLobby = 0;   // our own client joined first: it isn't a client of ours
+    client_clear_overrides("hosting");       // a host plays with its own settings
+    AcquireSRWLockShared(&g_cfgLock);
+    host_publish_locked("lobby ready");
+    ReleaseSRWLockShared(&g_cfgLock);
+}
+// Host: a member's data changed (a client announced its version). Log who has the mod.
+static void host_on_member(uint64_t lobby, uint64_t member) {
+    void* m = lobby_mm(lobby);
+    if (!m || member == g_sl.owner(m, lobby)) return;
+    const char* v = g_sl.getMember(m, lobby, member, "vultra_ver");
+    if (!v || !*v)                         logmsg("[sync] member %llx does NOT have VUltra", member);
+    else if (!strcmp(v, VULTRA_VERSION))   logmsg("[sync] member %llx has VUltra %s (in sync)", member, v);
+    else logmsg("[sync] member %llx has VUltra %.20s, host has %s (NOT synced)", member, v, VULTRA_VERSION);
 }
 
 // Client: drop the host's overrides and go back to the local ini.
@@ -1081,39 +1112,25 @@ static int parse_host_cfg(const char* s, CfgKV* out, int max) {
     }
     return n;
 }
-// Client: once a second, read the host's lobby data and apply it if it changed.
-static void client_sync_tick(void* client) {
-    static DWORD last = 0;
-    DWORD now = GetTickCount();
-    if (now - last < 1000) return;
-    last = now;
-    if (now - g_lastServerStep < 2000) { client_clear_overrides("hosting"); return; }   // we ARE the host
-    uint64_t lobby = 0;
-    if (client) memcpy(&lobby, reinterpret_cast<uint8_t*>(client) + OFF_CLIENT_LOBBY, sizeof(lobby));
+// Client: read the host's lobby data and apply it if it changed.
+static void client_apply_from_lobby(const char* why) {
+    uint64_t lobby = g_clientLobby;
     void* m = lobby_mm(lobby);
-    if (!m || !g_hostSync) { client_clear_overrides(m ? "sync turned off" : "left lobby"); return; }
-    static uint64_t announced = 0;
-    if (lobby != announced) {
-        g_sl.setMember(m, lobby, "vultra_ver", VULTRA_VERSION);
-        announced = lobby;
-        logmsg("[sync] joined lobby %llx; announced VUltra %s", lobby, VULTRA_VERSION);
-    }
+    if (!m) return;
+    if (!g_hostSync) { client_clear_overrides("sync turned off"); return; }
     const char* ver = g_sl.getData(m, lobby, "vultra_ver");
     const char* cfg = g_sl.getData(m, lobby, "vultra_cfg");
-    static char lastNote[64] = {0};
-    char note[64];
+    char note[64] = {0};
     if (!ver || !*ver)                       strcpy_s(note, "host has no VUltra");
     else if (strcmp(ver, VULTRA_VERSION))    sprintf_s(note, "host has VUltra %.20s, we have %s", ver, VULTRA_VERSION);
     else if (!cfg || !*cfg)                  strcpy_s(note, "host turned sync off");
-    else                                     note[0] = 0;
     if (note[0]) {
-        if (strcmp(note, lastNote)) { logmsg("[sync] not syncing: %s", note); strcpy_s(lastNote, note); }
+        logmsg("[sync] not syncing (%s): %s", why, note);
         client_clear_overrides(note);
         return;
     }
-    lastNote[0] = 0;
     static char lastCfg[4096] = {0};
-    if (g_cfgOvrActive && strcmp(cfg, lastCfg) == 0) return;   // nothing new
+    if (g_cfgOvrActive && strcmp(cfg, lastCfg) == 0) return;   // nothing new for us
     static CfgKV parsed[CFG_MAX];
     AcquireSRWLockExclusive(&g_cfgLock);
     int n = parse_host_cfg(cfg, parsed, CFG_MAX);
@@ -1123,7 +1140,92 @@ static void client_sync_tick(void* client) {
     apply_config_now("host settings");
     ReleaseSRWLockExclusive(&g_cfgLock);
     strncpy_s(lastCfg, cfg, _TRUNCATE);
-    logmsg("[sync] applied %d host settings from lobby %llx", n, lobby);
+    logmsg("[sync] applied %d host settings from lobby %llx (%s)", n, lobby, why);
+}
+// Client: we entered a lobby. Announce our version, then do the one-time initial read.
+static void client_on_joined(uint64_t lobby) {
+    if (!lobby) return;
+    if (lobby == g_hostLobby) return;          // our own hosted lobby: nothing to take
+    g_hostLobby = 0;                           // no longer hosting anything
+    g_clientLobby = lobby;
+    void* m = lobby_mm(lobby);
+    if (!m) { logmsg("[sync] joined lobby %llx but the Steam lobby api is unavailable", lobby); return; }
+    g_sl.setMember(m, lobby, "vultra_ver", VULTRA_VERSION);
+    logmsg("[sync] joined lobby %llx; announced VUltra %s", lobby, VULTRA_VERSION);
+    client_apply_from_lobby("joined");
+}
+static void client_on_left() {
+    if (!g_clientLobby && !g_cfgOvrActive) return;
+    logmsg("[sync] left lobby %llx", (uint64_t)g_clientLobby);
+    g_clientLobby = 0;
+    client_clear_overrides("left lobby");
+}
+
+// Steam LobbyDataUpdate_t (callback 505): fires when lobby data (member == lobby) or a member's
+// data (member == that player) changes. We register our own listener with SteamAPI_RegisterCallback.
+// The class mirrors the Steamworks SDK's CCallbackBase exactly (same virtuals, same order), so MSVC
+// lays out the same vtable steam_api expects.
+#pragma pack(push, 8)
+struct LobbyDataUpdate_t { uint64_t lobby; uint64_t member; uint8_t success; };
+#pragma pack(pop)
+class SteamCallbackBase {
+public:
+    virtual void Run(void* pvParam) = 0;
+    virtual void Run(void* pvParam, bool bIOFailure, uint64_t hSteamAPICall) = 0;
+    virtual int GetCallbackSizeBytes() = 0;
+    uint8_t m_nCallbackFlags = 0;
+    int m_iCallback = 0;
+};
+class LobbyDataListener : public SteamCallbackBase {
+public:
+    void Run(void* p) override {
+        const LobbyDataUpdate_t* u = static_cast<const LobbyDataUpdate_t*>(p);
+        if (!u || !u->success) return;
+        if (u->lobby == g_clientLobby && u->lobby != g_hostLobby && u->member == u->lobby)
+            client_apply_from_lobby("host changed settings");
+        else if (u->lobby == g_hostLobby && u->member != u->lobby) host_on_member(u->lobby, u->member);
+    }
+    void Run(void* p, bool, uint64_t) override { Run(p); }
+    int GetCallbackSizeBytes() override { return (int)sizeof(LobbyDataUpdate_t); }
+};
+static LobbyDataListener g_lobbyDataListener;
+static const int CB_LOBBY_DATA_UPDATE = 505;   // k_iSteamMatchmakingCallbacks (500) + 5
+static bool register_lobby_listener() {
+    HMODULE h = GetModuleHandleA("steam_api.dll");
+    typedef void (__cdecl *RegisterCallback_t)(void*, int);
+    RegisterCallback_t reg = h ? (RegisterCallback_t)GetProcAddress(h, "SteamAPI_RegisterCallback") : nullptr;
+    if (!reg) return false;
+    g_lobbyDataListener.m_iCallback = CB_LOBBY_DATA_UPDATE;
+    reg(&g_lobbyDataListener, CB_LOBBY_DATA_UPDATE);
+    return true;
+}
+
+// Game hooks feeding the events above.
+static const uintptr_t RVA_CLIENT_LOBBY_JOINED   = 0x0014cc50;  // Client::onSteamLobbyJoined(LobbyEnter_t*, bool)
+static const uintptr_t RVA_CLIENT_DISCONNECT     = 0x0015de80;  // Client::disconnect()
+static const uintptr_t RVA_SERVER_LOBBY_CREATED  = 0x0036ae20;  // Server::onSteamLobbyCreated(LobbyCreated_t*, bool)
+static const uintptr_t RVA_SERVER_UPDATE_LOBBY   = 0x0036aaa0;  // Server::updateLobbyInformation()
+typedef void (__fastcall *thisArg2_t)(void* self, void* edx, void* p, int io);
+typedef void (__fastcall *thisArg0_t)(void* self, void* edx);
+static thisArg2_t g_lobbyJoinedTramp = nullptr, g_lobbyCreatedTramp = nullptr;
+static thisArg0_t g_clientDisconnectTramp = nullptr, g_updateLobbyTramp = nullptr;
+static void __fastcall det_lobbyJoined(void* self, void* edx, void* p, int io) {
+    g_lobbyJoinedTramp(self, edx, p, io);
+    // LobbyEnter_t: m_ulSteamIDLobby @+0, m_EChatRoomEnterResponse @+0x10 (1 = success)
+    if (p && *reinterpret_cast<uint32_t*>(reinterpret_cast<uint8_t*>(p) + 0x10) == 1)
+        client_on_joined(*reinterpret_cast<uint64_t*>(p));
+}
+static void __fastcall det_clientDisconnect(void* self, void* edx) {
+    client_on_left();
+    g_clientDisconnectTramp(self, edx);
+}
+static void __fastcall det_lobbyCreated(void* self, void* edx, void* p, int io) {
+    g_lobbyCreatedTramp(self, edx, p, io);
+    host_on_lobby(self);
+}
+static void __fastcall det_updateLobby(void* self, void* edx) {
+    g_updateLobbyTramp(self, edx);
+    host_on_lobby(self);
 }
 
 static void save_config() {
@@ -1965,7 +2067,6 @@ static clientStep_t g_stepTramp = nullptr;
 static void flush_enemy_dups(void* ge);   // defined below (enemy-duplication section)
 static void __cdecl step_frame(void* client) {
     reload_if_ini_changed();   // pick up manager "Save" live (e.g. in the lobby) -> re-syncs mage options
-    client_sync_tick(client);  // MP client: apply the host's lobby-published settings (live)
     if (client) g_ge = reinterpret_cast<uint8_t*>(client) + OFF_CLIENT_GE;
     flush_enemy_dups(g_ge);    // spawn any queued enemy copies into the live level (deferred, safe here)
     // Difficulty model (self-driven; NO newGame hook — that crashed). Loop number = g_loopCount + 1:
@@ -2099,7 +2200,6 @@ typedef void (__fastcall *serverStep_t)(void* self, void* edx);
 static serverStep_t g_serverStepTramp = nullptr;
 static void __cdecl server_step_frame(void* server) {
     g_lastServerStep = GetTickCount();            // tell the client thread a server is active (= MP host)
-    host_sync_tick(server);                       // MP host: publish settings to the lobby (on change)
     // MP escalating-loop reset on the authoritative server GE: a fresh host run clears newGamePlus,
     // a looped run keeps it set (server_loop_now arms it). Keeps the cycle count correct on the host.
     if (server && *(reinterpret_cast<uint8_t*>(server) + OFF_SERVER_GE + OFF_GE_NEWGAMEPLUS) == 0)
@@ -3030,6 +3130,23 @@ static bool install_hook() {
         g_serverStepTramp = reinterpret_cast<serverStep_t>(
             install_detour(RVA_SERVER_STEP, (void*)&det_server_step, 5, step_pro, 5));
         logmsg("[vultra] MP server step-hook %s", g_serverStepTramp ? "installed" : "FAILED");
+        // Host settings sync (event-driven): lobby join/leave on the client, lobby ready on the host,
+        // plus a Steam listener for lobby-data changes.
+        g_lobbyJoinedTramp = reinterpret_cast<thisArg2_t>(
+            install_detour(RVA_CLIENT_LOBBY_JOINED, (void*)&det_lobbyJoined, 5, step_pro, 5));
+        g_clientDisconnectTramp = reinterpret_cast<thisArg0_t>(
+            install_detour(RVA_CLIENT_DISCONNECT, (void*)&det_clientDisconnect, 5, step_pro, 5));
+        g_lobbyCreatedTramp = reinterpret_cast<thisArg2_t>(
+            install_detour(RVA_SERVER_LOBBY_CREATED, (void*)&det_lobbyCreated, 5, step_pro, 5));
+        g_updateLobbyTramp = reinterpret_cast<thisArg0_t>(
+            install_detour(RVA_SERVER_UPDATE_LOBBY, (void*)&det_updateLobby, 5, step_pro, 5));
+        logmsg("[sync] hooks: joined=%s disconnect=%s created=%s updateLobby=%s listener=%s",
+               g_lobbyJoinedTramp ? "ok" : "FAILED", g_clientDisconnectTramp ? "ok" : "FAILED",
+               g_lobbyCreatedTramp ? "ok" : "FAILED", g_updateLobbyTramp ? "ok" : "FAILED",
+               register_lobby_listener() ? "ok" : "FAILED");
+        // Watch the game folder so an ini save (the manager's button) triggers the reload.
+        HANDLE wt = CreateThread(nullptr, 0, ini_watch_thread, nullptr, 0, nullptr);
+        if (wt) CloseHandle(wt);
         // MP host: catch the boss-win pre-broadcast (after GE::step, before sendGameState) so clients
         // never see gameComplete -> never roll the credits. Steal the 7-byte `cmp byte[ebx+0x10ef],0`.
         const uint8_t postge_pro[] = {0x80, 0xBB, 0xEF, 0x10, 0x00, 0x00, 0x00};
