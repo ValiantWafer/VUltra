@@ -19,7 +19,7 @@ public class ModInstaller(string gameDir)
                         bool debugWarp, int warpFloor, int loopStartFloor, int startDifficulty,
                         bool mageWandTree, bool mageRandomWand, bool mageWandZero, double harderByPct, int scalingStartsAt,
                         int spawnIncreasePct, int spawnIncreaseStartsAt, int spawnIncreaseMaxPct, int spawnSpreadPct,
-                        int spawnSpreadStartsAt, int spawnSpreadMaxPct, bool cursedBomb, bool randomMatchWeapon, bool randomNoTreeDefault, bool randomArcheryBow, bool randomHealth, int randomTreeCount, bool allowMidgameSpectators, bool keepLobbyJoinable, bool portalTwoWay)
+                        int spawnSpreadStartsAt, int spawnSpreadMaxPct, bool cursedBomb, bool randomMatchWeapon, bool randomNoTreeDefault, bool randomArcheryBow, bool randomHealth, int randomTreeCount, bool allowMidgameSpectators, bool keepLobbyJoinable, bool portalTwoWay, bool hostSettingsSync)
     {
         if (IsGameRunning) throw new InvalidOperationException("Close Vagante before installing.");
         if (!File.Exists(Proxy)) throw new FileNotFoundException("openal32.dll not found in the game folder.");
@@ -27,7 +27,7 @@ public class ModInstaller(string gameDir)
         if (!File.Exists(Orig)) File.Copy(Proxy, Orig);          // one-time pristine backup
         File.Copy(Orig, Real, overwrite: true);                  // forward target = real OpenAL
         WriteEmbeddedDll(Proxy);                                  // our proxy takes the slot
-        WriteIni(pool, wispCurse, loop, forceWisp, fairyMode, fairyStack, fairyHeal, debugWarp, warpFloor, loopStartFloor, startDifficulty, mageWandTree, mageRandomWand, mageWandZero, harderByPct, scalingStartsAt, spawnIncreasePct, spawnIncreaseStartsAt, spawnIncreaseMaxPct, spawnSpreadPct, spawnSpreadStartsAt, spawnSpreadMaxPct, cursedBomb, randomMatchWeapon, randomNoTreeDefault, randomArcheryBow, randomHealth, randomTreeCount, allowMidgameSpectators, keepLobbyJoinable, portalTwoWay);
+        WriteIni(pool, wispCurse, loop, forceWisp, fairyMode, fairyStack, fairyHeal, debugWarp, warpFloor, loopStartFloor, startDifficulty, mageWandTree, mageRandomWand, mageWandZero, harderByPct, scalingStartsAt, spawnIncreasePct, spawnIncreaseStartsAt, spawnIncreaseMaxPct, spawnSpreadPct, spawnSpreadStartsAt, spawnSpreadMaxPct, cursedBomb, randomMatchWeapon, randomNoTreeDefault, randomArcheryBow, randomHealth, randomTreeCount, allowMidgameSpectators, keepLobbyJoinable, portalTwoWay, hostSettingsSync);
     }
 
     public void Uninstall()
@@ -145,6 +145,9 @@ public class ModInstaller(string gameDir)
     /// <summary>Reads the two-way-portal toggle ([multiplayer] portal_two_way): interact on either portal end to teleport to the other. Default off. Both players need the mod. Live-toggleable.</summary>
     public bool ReadPortalTwoWay() => ReadInt("multiplayer", "portal_two_way", 0) != 0;
 
+    /// <summary>Reads the host-settings-sync toggle ([multiplayer] host_settings_sync): as host, publish settings to the lobby; as client, use the host's. Default on. Live-toggleable.</summary>
+    public bool ReadHostSettingsSync() => ReadInt("multiplayer", "host_settings_sync", 1) != 0;
+
     /// <summary>Reads the mage Wand-skill-tree toggle ([mage] wand_skill_tree). Default off.</summary>
     public bool ReadMageWandTree() => ReadBool("mage", "wand_skill_tree");
 
@@ -224,7 +227,7 @@ public class ModInstaller(string gameDir)
                          bool debugWarp, int warpFloor, int loopStartFloor, int startDifficulty,
                          bool mageWandTree, bool mageRandomWand, bool mageWandZero, double harderByPct, int scalingStartsAt,
                          int spawnIncreasePct, int spawnIncreaseStartsAt, int spawnIncreaseMaxPct, int spawnSpreadPct,
-                         int spawnSpreadStartsAt, int spawnSpreadMaxPct, bool cursedBomb, bool randomMatchWeapon, bool randomNoTreeDefault, bool randomArcheryBow, bool randomHealth, int randomTreeCount, bool allowMidgameSpectators, bool keepLobbyJoinable, bool portalTwoWay)
+                         int spawnSpreadStartsAt, int spawnSpreadMaxPct, bool cursedBomb, bool randomMatchWeapon, bool randomNoTreeDefault, bool randomArcheryBow, bool randomHealth, int randomTreeCount, bool allowMidgameSpectators, bool keepLobbyJoinable, bool portalTwoWay, bool hostSettingsSync)
     {
         // Single source of the file's structure and comments is the bundled template
         // (see IniDocs). We only stamp the current values onto it, so the descriptions and
@@ -263,6 +266,7 @@ public class ModInstaller(string gameDir)
             ["allow_midgame_spectators"] = b(allowMidgameSpectators),
             ["keep_lobby_joinable"]      = b(keepLobbyJoinable),
             ["portal_two_way"]           = b(portalTwoWay),
+            ["host_settings_sync"]       = b(hostSettingsSync),
         };
         foreach (var sp in Spells.All)
             values[sp.Key] = pool.TryGetValue(sp.Key, out var v) && v ? "1" : "0";
