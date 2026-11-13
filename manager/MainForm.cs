@@ -50,6 +50,7 @@ public class MainForm : Form
     CheckBox _randArcheryCheck = null!;          // Random class with Archery tree: also get a bow + 30 arrows
     CheckBox _randHealthCheck = null!;           // Random class: randomized max HP (60-100)
     NumericUpDown _randTreeCountNum = null!;      // Random class: how many skill trees to roll (0-16, stock 4)
+    CheckBox _houndAxeCheck = null!;             // Houndmaster starts with the brown axe + Axe tree (axe class preview)
     CheckBox _midgameSpecCheck = null!;          // Multiplayer: allow new joiners as spectators mid-game (startup)
     CheckBox _lobbyJoinableCheck = null!;        // Multiplayer: keep lobby advertised joinable mid-game (startup)
     CheckBox _hostSyncCheck = null!;             // Multiplayer: host publishes settings to the lobby / client uses the host's
@@ -455,6 +456,13 @@ public class MainForm : Form
                 Location = new Point(After(randTreeLbl), randTreeY) };
             Tip(_randTreeCountNum, randTreeTip);
             body.Controls.Add(_randTreeCountNum);
+
+            int houndAxeY = randTreeY + rowH;
+            _houndAxeCheck = new CheckBox {
+                Text = IniDocs.Title("houndmaster_axe"), AutoSize = true, ForeColor = Fg,
+                Location = new Point(x0, houndAxeY), FlatStyle = FlatStyle.Flat };
+            Tip(_houndAxeCheck, IniDocs.Desc("houndmaster_axe"));
+            body.Controls.Add(_houndAxeCheck);
         }
 
         // ===== MULTIPLAYER ===== (HOST ONLY, except host_settings_sync which both need). The portal fixes
@@ -574,6 +582,7 @@ public class MainForm : Form
         _mageWandZeroCheck.Checked = IniDocs.BoolValue("wand_zero_charges");
         _randHealthCheck.Checked = IniDocs.BoolValue("random_health");
         _randTreeCountNum.Value = ClampNum(IniDocs.IntValue("random_tree_count", 4), _randTreeCountNum);
+        _houndAxeCheck.Checked = IniDocs.BoolValue("houndmaster_axe");
         _midgameSpecCheck.Checked = IniDocs.BoolValue("allow_midgame_spectators");
         _lobbyJoinableCheck.Checked = IniDocs.BoolValue("keep_lobby_joinable");
         _hostSyncCheck.Checked = IniDocs.BoolValue("host_settings_sync", true);
@@ -668,6 +677,7 @@ public class MainForm : Form
         _randArcheryCheck.Checked = _inst.ReadRandomArcheryBow();
         _randHealthCheck.Checked = _inst.ReadRandomHealth();
         _randTreeCountNum.Value = Math.Clamp(_inst.ReadRandomTreeCount(), (int)_randTreeCountNum.Minimum, (int)_randTreeCountNum.Maximum);
+        _houndAxeCheck.Checked = _inst.ReadHoundmasterAxe();
         _midgameSpecCheck.Checked = _inst.ReadAllowMidgameSpectators();
         _lobbyJoinableCheck.Checked = _inst.ReadKeepLobbyJoinable();
         _hostSyncCheck.Checked = _inst.ReadHostSettingsSync();
@@ -697,7 +707,7 @@ public class MainForm : Form
     {
         if (_inst == null) return;
         if (ModInstaller.IsGameRunning) { SetStatus("Close Vagante first, then Install.", Warn); return; }
-        try { _inst.Install(PoolFromUi(), _wispCheck.Checked, _loopCheck.Checked, _forceWispCheck.Checked, _fairyCombo.SelectedIndex, _fairyStackCheck.Checked, (int)_fairyHealNum.Value, _debugCheck.Checked, _warpCombo.SelectedIndex, _loopStartCombo.SelectedIndex, (int)_startDiffNum.Value, _mageWandTreeCheck.Checked, _mageRandomWandCheck.Checked, _mageWandZeroCheck.Checked, (double)_harderByNum.Value, (int)_scalingStartsNum.Value, (int)_spawnPctNum.Value, (int)_spawnStartsNum.Value, (int)_spawnMaxNum.Value, (int)_spawnSpreadNum.Value, (int)_spawnSpreadStartsNum.Value, (int)_spawnSpreadMaxNum.Value, _cursedBombCheck.Checked, _randWeaponCheck.Checked, _randNoTreeCheck.Checked, _randArcheryCheck.Checked, _randHealthCheck.Checked, (int)_randTreeCountNum.Value, _midgameSpecCheck.Checked, _lobbyJoinableCheck.Checked, _hostSyncCheck.Checked); SetStatus("Installed. Launch Vagante - changes apply as new spellbooks generate.", Ok); MarkSaved(); }
+        try { _inst.Install(PoolFromUi(), _wispCheck.Checked, _loopCheck.Checked, _forceWispCheck.Checked, _fairyCombo.SelectedIndex, _fairyStackCheck.Checked, (int)_fairyHealNum.Value, _debugCheck.Checked, _warpCombo.SelectedIndex, _loopStartCombo.SelectedIndex, (int)_startDiffNum.Value, _mageWandTreeCheck.Checked, _mageRandomWandCheck.Checked, _mageWandZeroCheck.Checked, (double)_harderByNum.Value, (int)_scalingStartsNum.Value, (int)_spawnPctNum.Value, (int)_spawnStartsNum.Value, (int)_spawnMaxNum.Value, (int)_spawnSpreadNum.Value, (int)_spawnSpreadStartsNum.Value, (int)_spawnSpreadMaxNum.Value, _cursedBombCheck.Checked, _randWeaponCheck.Checked, _randNoTreeCheck.Checked, _randArcheryCheck.Checked, _randHealthCheck.Checked, (int)_randTreeCountNum.Value, _houndAxeCheck.Checked, _midgameSpecCheck.Checked, _lobbyJoinableCheck.Checked, _hostSyncCheck.Checked); SetStatus("Installed. Launch Vagante - changes apply as new spellbooks generate.", Ok); MarkSaved(); }
         catch (Exception ex) { SetStatus("Install failed: " + ex.Message, Warn); }
         RefreshButtons();
     }
@@ -707,7 +717,7 @@ public class MainForm : Form
         if (_inst == null) return;
         try
         {
-            _inst.WriteIni(PoolFromUi(), _wispCheck.Checked, _loopCheck.Checked, _forceWispCheck.Checked, _fairyCombo.SelectedIndex, _fairyStackCheck.Checked, (int)_fairyHealNum.Value, _debugCheck.Checked, _warpCombo.SelectedIndex, _loopStartCombo.SelectedIndex, (int)_startDiffNum.Value, _mageWandTreeCheck.Checked, _mageRandomWandCheck.Checked, _mageWandZeroCheck.Checked, (double)_harderByNum.Value, (int)_scalingStartsNum.Value, (int)_spawnPctNum.Value, (int)_spawnStartsNum.Value, (int)_spawnMaxNum.Value, (int)_spawnSpreadNum.Value, (int)_spawnSpreadStartsNum.Value, (int)_spawnSpreadMaxNum.Value, _cursedBombCheck.Checked, _randWeaponCheck.Checked, _randNoTreeCheck.Checked, _randArcheryCheck.Checked, _randHealthCheck.Checked, (int)_randTreeCountNum.Value, _midgameSpecCheck.Checked, _lobbyJoinableCheck.Checked, _hostSyncCheck.Checked);
+            _inst.WriteIni(PoolFromUi(), _wispCheck.Checked, _loopCheck.Checked, _forceWispCheck.Checked, _fairyCombo.SelectedIndex, _fairyStackCheck.Checked, (int)_fairyHealNum.Value, _debugCheck.Checked, _warpCombo.SelectedIndex, _loopStartCombo.SelectedIndex, (int)_startDiffNum.Value, _mageWandTreeCheck.Checked, _mageRandomWandCheck.Checked, _mageWandZeroCheck.Checked, (double)_harderByNum.Value, (int)_scalingStartsNum.Value, (int)_spawnPctNum.Value, (int)_spawnStartsNum.Value, (int)_spawnMaxNum.Value, (int)_spawnSpreadNum.Value, (int)_spawnSpreadStartsNum.Value, (int)_spawnSpreadMaxNum.Value, _cursedBombCheck.Checked, _randWeaponCheck.Checked, _randNoTreeCheck.Checked, _randArcheryCheck.Checked, _randHealthCheck.Checked, (int)_randTreeCountNum.Value, _houndAxeCheck.Checked, _midgameSpecCheck.Checked, _lobbyJoinableCheck.Checked, _hostSyncCheck.Checked);
             SetStatus(ModInstaller.IsGameRunning
                 ? "Saved. Already-running game picks it up on the next room/level."
                 : "Saved.", Ok);
@@ -786,6 +796,7 @@ public class MainForm : Form
           .Append('|').Append(_randArcheryCheck.Checked ? 1 : 0)
           .Append('|').Append(_randHealthCheck.Checked ? 1 : 0)
           .Append('|').Append((int)_randTreeCountNum.Value)
+          .Append('|').Append(_houndAxeCheck.Checked ? 1 : 0)
           .Append('|').Append(_midgameSpecCheck.Checked ? 1 : 0)
           .Append('|').Append(_lobbyJoinableCheck.Checked ? 1 : 0)
           .Append('|').Append(_hostSyncCheck.Checked ? 1 : 0);

@@ -370,6 +370,11 @@ static volatile bool g_randWeaponMatch = false;  // [player] random_match_weapon
 static volatile bool g_randNoTreeDefault = true; // [player] random_no_tree_default: no weapon tree -> default weapon (off = fists)
 static volatile bool g_randArcheryBow = true;    // [player] random_archery_bow: Archery skill tree also grants a bow + 30 arrows
 static volatile bool g_randHealth = false;       // [player] random_health: Random char starts with a randomized max HP (60..100)
+// [player] houndmaster_axe: preview of the axe class. The Houndmaster (CLASS_BEASTMASTER) starts with the
+// brown axe and the new Axe skill tree in place of the club and the Club tree. See "Axe skill tree" below.
+static volatile bool g_houndmasterAxe = false;
+static const int ITEMTYPE_AXE_BROWN = 64;        // ITEMTYPE_AXE (the low-tier axe; AXE2 = 65 is the upgrade)
+static int __cdecl houndmaster_default_weapon() { return g_houndmasterAxe ? ITEMTYPE_AXE_BROWN : 0x37; }  // 0x37 = ITEMTYPE_CLUB
 // [player] random_tree_count: how many skill trees (affinities) a Random character rolls. Stock is a
 // hardcoded 4 in PlayerMenu::randomizeAffinities (it shuffles a 16-entry pool of distinct affinity
 // types -- 0,1,2,3,5,11,12,13,14,15,16,18,19,20,21,25 -- and takes the first N). We rewrite that site,
@@ -468,6 +473,7 @@ static int affinity_to_weapon_type(int at) {
         case 18: return 85;   // CQC     -> ITEMTYPE_CAESTUS (fists)
         case 21: return 79;   // ROD     -> ITEMTYPE_ROD
         case 25: return 55;   // CLUB    -> ITEMTYPE_CLUB
+        case 26: return 64;   // AXE (the mod's tree) -> ITEMTYPE_AXE
         default: return -1;   // not a weapon skill tree
     }
 }
@@ -574,7 +580,8 @@ __declspec(naked) static void det_beastWeapon() {         // BEASTMASTER: mov [e
         push eax
         push ecx
         push edx
-        push 0x37
+        call houndmaster_default_weapon       // eax = ITEMTYPE_CLUB, or the brown axe with houndmaster_axe on
+        push eax
         push dword ptr [ebp+8]
         call pick_random_class_weapon
         add  esp, 8
@@ -905,6 +912,7 @@ static void load_config() {
     g_randNoTreeDefault = cfg_int("player", "random_no_tree_default", 1, g_iniPath) != 0;  // 1=default weapon, 0=fists
     g_randArcheryBow = cfg_int("player", "random_archery_bow", 1, g_iniPath) != 0;  // Archery tree -> +bow +30 arrows
     g_randHealth = cfg_int("player", "random_health", 0, g_iniPath) != 0;  // random max HP 60..100 for Random chars
+    g_houndmasterAxe = cfg_int("player", "houndmaster_axe", 0, g_iniPath) != 0;  // next Houndmaster built: axe + Axe tree
     g_randomTreeCount = (int)cfg_int("player", "random_tree_count", 4, g_iniPath);  // # skill trees a Random char rolls (stock 4)
     if (g_randomTreeCount < 0)  g_randomTreeCount = 0;
     if (g_randomTreeCount > 16) g_randomTreeCount = 16;   // candidate pool is 16 distinct affinity types
@@ -2674,6 +2682,323 @@ static void __cdecl det_populateAffinities(void* player, void* ctrl, int* begin,
     }
     g_populateAffTramp(player, ctrl, begin, end, cap);
 }
+// ---- Axe skill tree (a new AffinityType 26) -----------------------------------------------------
+// Axes are the one weapon family with no tree. This adds one built from the Club tree, but only for axes:
+//   1 Fatiguing Blows  harder hits that stun more   (Club's level 1)
+//   2 Charged Attack   hold attack to charge        (Club's level 2)
+//   3 Axe Throw        up + attack throws the axe; it comes back like a thrown dagger (Dagger's level 2)
+//   4 Faster Charge    charges faster               (Club's level 4)
+// The game's own types are 0..25 (CLUB = 25), so 26 is free. Affinity::getNewAffinity only knows 0..25;
+// we answer 26 ourselves with an Affinity built exactly like the Club one (same ctor, size and icon),
+// pointing at our own copy of AffinityClub's vtable with two slots replaced: initSkillStrings (runs
+// Club's, then renames the strings) and levelUp (only bumps the level). The perks don't use flags in
+// AffinityAttributes; each check below reads the Axe tree's level straight off the player instead, so
+// whatever sets the level (level-up, save load, network) is automatically right.
+//   "Is this an axe" = the weapon's WeaponProperties name is "axe" or "axe2". Axes have no typeFlags bit
+// (clubs are 0x80, daggers 0x02), and isHeavy also covers the spear, black sword and Thunder God hammer.
+//   Charging needs a charge keyframe. Clubs swing with "player-swing", which has one; axes use
+// "player-heavy-swing", which has none, so we set Weapon::chargeAttackFrame to its wind-up keyframe (5)
+// whenever an axe charge starts. Only the Weapon ctors set that field, so this never leaks to others.
+//   A machine without the mod can't build type 26 (its factory has no case for it), so a co-op player
+// with the Axe tree needs everyone on the mod, and a save holding the tree needs the mod to load.
+static const int AFFINITY_CLUB = 25;
+static const int AFFINITY_AXE  = 26;
+static const int AXE_MAX_LEVEL = 4;
+static const int AXE_ICON_FRAME = 0x18;                       // Club's icon frame (no axe icon exists yet)
+static const int AXE_CHARGE_KEYFRAME = 5;                     // player-heavy-swing's wind-up keyframe
+static const uintptr_t RVA_GET_NEW_AFFINITY  = 0x000ecb70;   // Affinity::getNewAffinity(type, int) (ecx, edx)
+static const uintptr_t RVA_AFFINITY_CTOR     = 0x000ec060;   // Affinity::Affinity(AffinityType, unsigned maxLevel)
+static const uintptr_t RVA_SPRITE_SET_FRAME  = 0x003b9c20;   // Sprite::setFrame(int)
+static const uintptr_t RVA_STRING_ASSIGN     = 0x0000b2b0;   // std::string::assign(const char*, size_t)
+static const uintptr_t RVA_CLUB_VTABLE       = 0x007165b4;   // AffinityClub::`vftable'
+static const uintptr_t RVA_SET_STARTING_AFFS = 0x00309f40;   // PlayerCustomizer::setStartingAffinities (cdecl)
+static const size_t OFF_PLAYER_AFFS          = 0x870;        // Player::affinities vector<Affinity*>
+static const size_t OFF_PLAYER_CURRWEAPON    = 0x76b8;       // Player::currWeapon (shared_ptr<Weapon>, raw ptr)
+static const size_t OFF_WEAPON_ATTACKSCRIPT  = 0x318;        // Weapon::attackScript
+static const size_t OFF_WEAPON_PROPS         = 0x31c;        // Weapon::weaponProperties
+
+typedef void  (__fastcall *affCtor_t)(void* self, void* edx, int type, int maxLevel);
+typedef void  (__fastcall *spriteSetFrame_t)(void* self, void* edx, int frame);
+typedef void* (__fastcall *strAssign_t)(void* self, void* edx, const char* p, size_t n);
+typedef void  (__fastcall *affInit_t)(void* self, void* edx);
+typedef void* (__fastcall *affDtor_t)(void* self, void* edx, unsigned flags);
+typedef void* (__fastcall *getNewAff_t)(int type, int arg);
+typedef void  (__cdecl *setStartAffs_t)(void* player, void* ctrl);
+
+// MSVC std::string: inline buffer when capacity (+0x14) < 16, else a heap pointer; size at +0x10.
+static const char* game_str(const uint8_t* s, size_t* len) {
+    if (len) *len = *reinterpret_cast<const uint32_t*>(s + 0x10);
+    uint32_t cap = *reinterpret_cast<const uint32_t*>(s + 0x14);
+    return cap >= 16 ? *reinterpret_cast<const char* const*>(s) : reinterpret_cast<const char*>(s);
+}
+static bool game_str_is(const uint8_t* s, const char* want) {
+    size_t n; const char* p = game_str(s, &n);
+    return n == strlen(want) && memcmp(p, want, n) == 0;
+}
+static bool is_axe_props(const uint8_t* props) {
+    return props && (game_str_is(props, "axe") || game_str_is(props, "axe2"));
+}
+// Level of the player's Axe tree (0 if they don't have it).
+static int axe_tree_level(const uint8_t* player) {
+    if (!player) return 0;
+    uint8_t* const* b = *reinterpret_cast<uint8_t* const* const*>(player + OFF_PLAYER_AFFS);
+    uint8_t* const* e = *reinterpret_cast<uint8_t* const* const*>(player + OFF_PLAYER_AFFS + 4);
+    if (!b || e <= b) return 0;
+    for (uint8_t* const* it = b; it < e; ++it)
+        if (*it && *reinterpret_cast<int*>(*it + 4) == AFFINITY_AXE) return *reinterpret_cast<int*>(*it + 0x24);
+    return 0;
+}
+
+// Our vtable: [0] = AffinityClub's RTTI locator, [1..4] = the 4 virtuals (dtor, initSkillStrings, levelUp, sync).
+static void* g_axeVtbl[5];
+static affInit_t g_clubInitStrings = nullptr;
+static const char* const kAxeText[][2] = {
+    { "Club", "Axe" },
+    { "Club attacks deal more damage and stun enemies more.", "Axe attacks deal more damage and stun enemies more." },
+    { "Shockwave", "Axe Throw" },
+    { "Fully charged attacks unleash a powerful shockwave.",
+      "Hold up and attack to throw your axe. Thrown axes return to their owner." },
+};
+static void axe_rename(uint8_t* s) {
+    for (const auto& t : kAxeText)
+        if (game_str_is(s, t[0])) {
+            reinterpret_cast<strAssign_t>(g_base + RVA_STRING_ASSIGN)(s, nullptr, t[1], strlen(t[1]));
+            return;
+        }
+}
+static void __fastcall axe_initSkillStrings(uint8_t* self, void*) {
+    g_clubInitStrings(self, nullptr);                 // fills name + 4 skill names/descriptions (game allocator)
+    axe_rename(self + 0xc);                           // Affinity::name
+    static const size_t kVecs[2] = { 0x34, 0x40 };   // skillNames, skillDescriptions (vector<string>)
+    for (size_t vo : kVecs) {
+        uint8_t* b = *reinterpret_cast<uint8_t**>(self + vo);
+        uint8_t* e = *reinterpret_cast<uint8_t**>(self + vo + 4);
+        for (uint8_t* s = b; b && s + 0x18 <= e; s += 0x18) axe_rename(s);
+    }
+    static bool logged = false;   // once per session: what the menu will show
+    if (!logged) {
+        logged = true;
+        logmsg("[axe] tree name: %s", game_str(self + 0xc, nullptr));
+        for (size_t vo : kVecs) {
+            uint8_t* b = *reinterpret_cast<uint8_t**>(self + vo);
+            uint8_t* e = *reinterpret_cast<uint8_t**>(self + vo + 4);
+            for (uint8_t* s = b; b && s + 0x18 <= e; s += 0x18) logmsg("[axe]   %s", game_str(s, nullptr));
+        }
+    }
+}
+static void __fastcall axe_levelUp(uint8_t* self, void*, void* /*attributes*/) {
+    ++*reinterpret_cast<int*>(self + 0x24);           // perks read this level directly (see above)
+}
+// Build an uninitialized Axe Affinity, the way getNewAffinity builds the Club one. Callers run
+// initSkillStrings (vtable slot 1) afterwards, as they do for every factory result.
+static uint8_t* make_axe_affinity() {
+    if (!g_axeVtbl[1] || !g_opnew) return nullptr;
+    uint8_t* a = static_cast<uint8_t*>(g_opnew(0x1e8));
+    if (!a) return nullptr;
+    reinterpret_cast<affCtor_t>(g_base + RVA_AFFINITY_CTOR)(a, nullptr, AFFINITY_AXE, AXE_MAX_LEVEL);
+    *reinterpret_cast<void***>(a) = &g_axeVtbl[1];
+    reinterpret_cast<spriteSetFrame_t>(g_base + RVA_SPRITE_SET_FRAME)(a + 0x4c, nullptr, AXE_ICON_FRAME);
+    return a;
+}
+static getNewAff_t g_getNewAffTramp = nullptr;
+static void* __fastcall det_getNewAffinity(int type, int arg) {
+    if (type == AFFINITY_AXE) return make_axe_affinity();
+    return g_getNewAffTramp(type, arg);
+}
+// houndmaster_axe: after the class trees are built, swap the Houndmaster's Club tree for the Axe tree.
+// (setStartingAffinities builds its trees inline, not through getNewAffinity.) Random characters are
+// built by populateAffinities instead, so this only touches a picked Houndmaster.
+static setStartAffs_t g_setStartAffsTramp = nullptr;
+static void __cdecl det_setStartingAffinities(void* player, void* ctrl) {
+    g_setStartAffsTramp(player, ctrl);
+    uint8_t* p = static_cast<uint8_t*>(player);
+    if (!g_houndmasterAxe || !p || *reinterpret_cast<int*>(p + 0x34c) != 4) return;   // CLASS_BEASTMASTER
+    uint8_t** b = *reinterpret_cast<uint8_t***>(p + OFF_PLAYER_AFFS);
+    uint8_t** e = *reinterpret_cast<uint8_t***>(p + OFF_PLAYER_AFFS + 4);
+    for (uint8_t** it = b; b && it < e; ++it) {
+        uint8_t* old = *it;
+        if (!old || *reinterpret_cast<int*>(old + 4) != AFFINITY_CLUB) continue;
+        uint8_t* axe = make_axe_affinity();
+        if (!axe) return;
+        axe_initSkillStrings(axe, nullptr);
+        *reinterpret_cast<int*>(axe + 0x24) = *reinterpret_cast<int*>(old + 0x24);   // keep any starting level
+        *it = axe;
+        reinterpret_cast<affDtor_t>((*reinterpret_cast<void***>(old))[0])(old, nullptr, 1);   // delete old
+        logmsg("[axe] houndmaster: Club tree -> Axe tree (player=%p)", p);
+        return;
+    }
+}
+
+// Player::attack, level 1 (the stun bonus). Stock: `if (isClub) { if (clubBonusStun) <apply> } else <next
+// weapon check>`. We route the same three ways, adding "axe with Axe tree >= 1" to <apply>.
+static uintptr_t g_axeStunApply = 0, g_axeStunSkip = 0, g_axeStunNotClub = 0, g_axeStunJmp = 0;
+static uintptr_t __cdecl axe_stun_route(const uint8_t* player, const uint8_t* props) {
+    if (props[0x5c] & 0x80) return player[0x9e8] ? g_axeStunApply : g_axeStunSkip;   // club, clubBonusStun
+    if (is_axe_props(props) && axe_tree_level(player) >= 1) return g_axeStunApply;
+    return g_axeStunNotClub;
+}
+__declspec(naked) static void det_axeStun() {   // at Player::attack 0x2d3388: edx = props, edi = player
+    __asm {
+        pushad
+        push edx
+        push edi
+        call axe_stun_route
+        add  esp, 8
+        mov  g_axeStunJmp, eax
+        popad
+        jmp  dword ptr [g_axeStunJmp]
+    }
+}
+// Player::attack, levels 2-4. Replaces the whole stock club block (charge + fast charge) with the same
+// logic plus the axe version. Level 3 sets Weapon::doDaggerThrow from "up held" exactly as the Dagger
+// tree does; a throw takes priority over charging that swing.
+static uintptr_t g_axeChargeResume = 0;
+static void __cdecl axe_charge_apply(uint8_t* player, const uint8_t* props, uint8_t* weapon) {
+    if (props[0x5c] & 0x80) {                                      // club: stock behaviour, unchanged
+        if (player[0x9e9]) {                                       // clubCanCharge
+            weapon[0x28c] = 1;                                     // chargingAttack
+            if (player[0x9eb]) {                                   // clubFastCharge
+                uint8_t* cw = *reinterpret_cast<uint8_t**>(player + OFF_PLAYER_CURRWEAPON);
+                *reinterpret_cast<int*>(cw + 0x294) = 0x28;        // chargeAttackTimer head start
+            }
+        }
+        return;
+    }
+    if (!is_axe_props(props)) return;
+    int lvl = axe_tree_level(player);
+    if (lvl <= 0) return;
+    bool throwing = false;
+    if (lvl >= 3) { weapon[0x2a5] = player[0x49c]; throwing = player[0x49c] != 0; }   // doDaggerThrow = up held
+    if (lvl >= 2 && !throwing) {
+        weapon[0x28c] = 1;                                          // chargingAttack
+        *reinterpret_cast<int*>(weapon + 0x290) = AXE_CHARGE_KEYFRAME;   // chargeAttackFrame
+        if (lvl >= 4) *reinterpret_cast<int*>(weapon + 0x294) = 0x28;
+    }
+}
+__declspec(naked) static void det_axeCharge() {   // at Player::attack 0x2d3612: ecx = props, edx = weapon, edi = player
+    __asm {
+        pushad
+        push edx
+        push ecx
+        push edi
+        call axe_charge_apply
+        add  esp, 12
+        popad
+        jmp  dword ptr [g_axeChargeResume]
+    }
+}
+// In-place replacements for `mov al,[reg+0x5c]; shr al,N; and al,1` type checks: al = the answer, ZF
+// set from it (the stock je follows), every other register (and eax's upper bytes) kept.
+static int __cdecl club_or_axe(const uint8_t* props)   { return (props[0x5c] & 0x80) || is_axe_props(props); }
+static int __cdecl dagger_or_axe(const uint8_t* props) { return (props[0x5c] & 0x02) || is_axe_props(props); }
+// Network copy of a swing (Player::interpolate): an axe counts as a dagger only when the swing is a throw,
+// so a normal axe swing still reaches the checks after the dagger branch.
+static int __cdecl dagger_or_thrown_axe(const uint8_t* props, const uint8_t* net) {
+    return (props[0x5c] & 0x02) || (net && net[7] && is_axe_props(props));
+}
+__declspec(naked) static void stub_clubOrAxe_eax() {    // Weapon::stepSwing: the "fully charged" ding
+    __asm {
+        push ecx
+        push edx
+        push eax
+        push eax
+        call club_or_axe
+        add  esp, 4
+        mov  ecx, eax
+        pop  eax
+        mov  al, cl
+        pop  edx
+        pop  ecx
+        and  al, 1
+        ret
+    }
+}
+__declspec(naked) static void stub_daggerOrAxe_eax() {  // Weapon::stepSwing throw + Player::attack throw damage
+    __asm {
+        push ecx
+        push edx
+        push eax
+        push eax
+        call dagger_or_axe
+        add  esp, 4
+        mov  ecx, eax
+        pop  eax
+        mov  al, cl
+        pop  edx
+        pop  ecx
+        and  al, 1
+        ret
+    }
+}
+__declspec(naked) static void stub_daggerOrThrownAxe_ecx() {   // Player::interpolate: props in ecx, net state at [ebp-0x14]
+    __asm {
+        push ecx
+        push edx
+        push eax
+        push dword ptr [ebp-0x14]
+        push ecx
+        call dagger_or_thrown_axe
+        add  esp, 8
+        mov  edx, eax
+        pop  eax
+        mov  al, dl
+        pop  edx
+        pop  ecx
+        and  al, 1
+        ret
+    }
+}
+// Write `jmp dest` (or `call dest`) over len expected bytes at rva, NOP-padding the rest. `prefix` bytes
+// of the original are kept in front of the call (for P5, whose check has an unrelated mov in the middle).
+static bool axe_patch(const char* name, uintptr_t rva, const uint8_t* expect, int len, uint8_t op, void* dest,
+                      const uint8_t* prefix = nullptr, int prefixLen = 0) {
+    uint8_t buf[64];
+    if (len > (int)sizeof(buf) || prefixLen + 5 > len) return false;
+    memset(buf, 0x90, len);
+    if (prefixLen) memcpy(buf, prefix, prefixLen);
+    uint8_t* at = reinterpret_cast<uint8_t*>(g_base + rva) + prefixLen;
+    buf[prefixLen] = op;
+    *reinterpret_cast<int32_t*>(buf + prefixLen + 1) =
+        static_cast<int32_t>(reinterpret_cast<uint8_t*>(dest) - (at + 5));
+    bool ok = patch_replace(name, rva, expect, buf, len);
+    logmsg("[axe] %s %s", name, ok ? "patched" : "FAILED");
+    return ok;
+}
+static void install_axe_tree() {
+    // vtable copy (RTTI locator + 4 slots), with our initSkillStrings and levelUp.
+    void** club = reinterpret_cast<void**>(g_base + RVA_CLUB_VTABLE);
+    for (int i = 0; i < 5; i++) g_axeVtbl[i] = club[i - 1];
+    g_clubInitStrings = reinterpret_cast<affInit_t>(club[1]);
+    g_axeVtbl[2] = reinterpret_cast<void*>(&axe_initSkillStrings);
+    g_axeVtbl[3] = reinterpret_cast<void*>(&axe_levelUp);
+
+    const uint8_t pro[5] = {0x55, 0x8B, 0xEC, 0x6A, 0xFF};   // push ebp; mov ebp,esp; push -1
+    g_getNewAffTramp = reinterpret_cast<getNewAff_t>(install_detour(RVA_GET_NEW_AFFINITY, (void*)&det_getNewAffinity, 5, pro, 5));
+    g_setStartAffsTramp = reinterpret_cast<setStartAffs_t>(install_detour(RVA_SET_STARTING_AFFS, (void*)&det_setStartingAffinities, 5, pro, 5));
+    logmsg("[axe] factory hook %s, starting-trees hook %s",
+           g_getNewAffTramp ? "installed" : "FAILED", g_setStartAffsTramp ? "installed" : "FAILED");
+    if (!g_getNewAffTramp) return;   // without the factory the tree can't exist; leave the weapons stock
+
+    g_axeStunApply   = g_base + 0x002d339b;
+    g_axeStunSkip    = g_base + 0x002d340e;
+    g_axeStunNotClub = g_base + 0x002d33c7;
+    g_axeChargeResume = g_base + 0x002d3645;
+    const uint8_t p1[] = {0x8A,0x42,0x5C,0xC0,0xE8,0x07,0x24,0x01,0x74,0x35,0x80,0xBF,0xE8,0x09,0x00,0x00,0x00,0x74,0x73};
+    const uint8_t p2[] = {0x8A,0x41,0x5C,0xC0,0xE8,0x07,0x24,0x01,0x74,0x29,0x80,0xBF,0xE9,0x09,0x00,0x00,0x00,0x74,0x20,
+                          0xC6,0x82,0x8C,0x02,0x00,0x00,0x01,0x80,0xBF,0xEB,0x09,0x00,0x00,0x00,0x74,0x10,0x8B,0x87,0xB8,
+                          0x76,0x00,0x00,0xC7,0x80,0x94,0x02,0x00,0x00,0x28,0x00,0x00,0x00};
+    const uint8_t p4[] = {0x8A,0x40,0x5C,0xC0,0xE8,0x07,0x24,0x01};
+    const uint8_t p5[] = {0x8A,0x40,0x5C,0x8B,0x8E,0x18,0x03,0x00,0x00,0xD0,0xE8,0x24,0x01};
+    const uint8_t p6[] = {0x8A,0x41,0x5C,0xD0,0xE8,0x24,0x01};
+    const uint8_t p7[] = {0x8A,0x40,0x5C,0xD0,0xE8,0x24,0x01};
+    axe_patch("attack: stun (lv1)",          0x002d3388, p1, sizeof(p1), 0xE9, (void*)&det_axeStun);
+    axe_patch("attack: charge/throw (lv2-4)", 0x002d3612, p2, sizeof(p2), 0xE9, (void*)&det_axeCharge);
+    axe_patch("stepSwing: charged ding",     0x003f033a, p4, sizeof(p4), 0xE8, (void*)&stub_clubOrAxe_eax);
+    axe_patch("stepSwing: throw",            0x003f076e, p5, sizeof(p5), 0xE8, (void*)&stub_daggerOrAxe_eax, p5 + 3, 6);
+    axe_patch("interpolate: net throw",      0x002f09e8, p6, sizeof(p6), 0xE8, (void*)&stub_daggerOrThrownAxe_ecx);
+    axe_patch("attack: throw damage",        0x002d36e7, p7, sizeof(p7), 0xE8, (void*)&stub_daggerOrAxe_eax);
+}
+
 // Random-class wands can be created by ANY class branch (knight/rogue/... whose weapon we swapped to a
 // wand), not just the mage branch, so the mage byte-patch that zeroes charges doesn't reach them. When
 // g_wandZeroCharges is on, zero the equipped weapon's charges here if a Random char ended up holding a
@@ -3112,6 +3437,8 @@ static bool install_hook() {
         logmsg("[vultra] portal two-way hook %s (portal_two_way=%d)",
                install_portal_twoway() ? "installed" : "FAILED", g_portalTwoWay);
     }
+    // Axe skill tree (AffinityType 26) and the axe-only versions of the club/dagger perks.
+    install_axe_tree();
     // Random character skill-tree count: rewrite the hardcoded 4 in randomizeAffinities.
     apply_random_tree_count();
     // Companion hooks so random_tree_count == 0 yields truly zero trees (not the class defaults):

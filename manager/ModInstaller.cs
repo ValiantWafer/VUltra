@@ -19,7 +19,7 @@ public class ModInstaller(string gameDir)
                         bool debugWarp, int warpFloor, int loopStartFloor, int startDifficulty,
                         bool mageWandTree, bool mageRandomWand, bool mageWandZero, double harderByPct, int scalingStartsAt,
                         int spawnIncreasePct, int spawnIncreaseStartsAt, int spawnIncreaseMaxPct, int spawnSpreadPct,
-                        int spawnSpreadStartsAt, int spawnSpreadMaxPct, bool cursedBomb, bool randomMatchWeapon, bool randomNoTreeDefault, bool randomArcheryBow, bool randomHealth, int randomTreeCount, bool allowMidgameSpectators, bool keepLobbyJoinable, bool hostSettingsSync)
+                        int spawnSpreadStartsAt, int spawnSpreadMaxPct, bool cursedBomb, bool randomMatchWeapon, bool randomNoTreeDefault, bool randomArcheryBow, bool randomHealth, int randomTreeCount, bool houndmasterAxe, bool allowMidgameSpectators, bool keepLobbyJoinable, bool hostSettingsSync)
     {
         if (IsGameRunning) throw new InvalidOperationException("Close Vagante before installing.");
         if (!File.Exists(Proxy)) throw new FileNotFoundException("openal32.dll not found in the game folder.");
@@ -27,7 +27,7 @@ public class ModInstaller(string gameDir)
         if (!File.Exists(Orig)) File.Copy(Proxy, Orig);          // one-time pristine backup
         File.Copy(Orig, Real, overwrite: true);                  // forward target = real OpenAL
         WriteEmbeddedDll(Proxy);                                  // our proxy takes the slot
-        WriteIni(pool, wispCurse, loop, forceWisp, fairyMode, fairyStack, fairyHeal, debugWarp, warpFloor, loopStartFloor, startDifficulty, mageWandTree, mageRandomWand, mageWandZero, harderByPct, scalingStartsAt, spawnIncreasePct, spawnIncreaseStartsAt, spawnIncreaseMaxPct, spawnSpreadPct, spawnSpreadStartsAt, spawnSpreadMaxPct, cursedBomb, randomMatchWeapon, randomNoTreeDefault, randomArcheryBow, randomHealth, randomTreeCount, allowMidgameSpectators, keepLobbyJoinable, hostSettingsSync);
+        WriteIni(pool, wispCurse, loop, forceWisp, fairyMode, fairyStack, fairyHeal, debugWarp, warpFloor, loopStartFloor, startDifficulty, mageWandTree, mageRandomWand, mageWandZero, harderByPct, scalingStartsAt, spawnIncreasePct, spawnIncreaseStartsAt, spawnIncreaseMaxPct, spawnSpreadPct, spawnSpreadStartsAt, spawnSpreadMaxPct, cursedBomb, randomMatchWeapon, randomNoTreeDefault, randomArcheryBow, randomHealth, randomTreeCount, houndmasterAxe, allowMidgameSpectators, keepLobbyJoinable, hostSettingsSync);
     }
 
     public void Uninstall()
@@ -136,6 +136,9 @@ public class ModInstaller(string gameDir)
     /// <summary>Reads how many skill trees a Random character rolls ([player] random_tree_count): 0-16, default 4 (stock).</summary>
     public int ReadRandomTreeCount() => ReadInt("player", "random_tree_count", 4);
 
+    /// <summary>Reads the axe-class preview ([player] houndmaster_axe): the Houndmaster starts with the brown axe and the Axe tree. Default off.</summary>
+    public bool ReadHoundmasterAxe() => ReadInt("player", "houndmaster_axe", 0) != 0;
+
     /// <summary>Reads the mid-game spectator toggle ([multiplayer] allow_midgame_spectators): host keeps accepting new joiners (as spectators) after the run starts. Default off. Applied at startup.</summary>
     public bool ReadAllowMidgameSpectators() => ReadInt("multiplayer", "allow_midgame_spectators", 0) != 0;
 
@@ -224,7 +227,7 @@ public class ModInstaller(string gameDir)
                          bool debugWarp, int warpFloor, int loopStartFloor, int startDifficulty,
                          bool mageWandTree, bool mageRandomWand, bool mageWandZero, double harderByPct, int scalingStartsAt,
                          int spawnIncreasePct, int spawnIncreaseStartsAt, int spawnIncreaseMaxPct, int spawnSpreadPct,
-                         int spawnSpreadStartsAt, int spawnSpreadMaxPct, bool cursedBomb, bool randomMatchWeapon, bool randomNoTreeDefault, bool randomArcheryBow, bool randomHealth, int randomTreeCount, bool allowMidgameSpectators, bool keepLobbyJoinable, bool hostSettingsSync)
+                         int spawnSpreadStartsAt, int spawnSpreadMaxPct, bool cursedBomb, bool randomMatchWeapon, bool randomNoTreeDefault, bool randomArcheryBow, bool randomHealth, int randomTreeCount, bool houndmasterAxe, bool allowMidgameSpectators, bool keepLobbyJoinable, bool hostSettingsSync)
     {
         // Single source of the file's structure and comments is the bundled template
         // (see IniDocs). We only stamp the current values onto it, so the descriptions and
@@ -260,6 +263,7 @@ public class ModInstaller(string gameDir)
             ["random_archery_bow"]       = b(randomArcheryBow),
             ["random_health"]            = b(randomHealth),
             ["random_tree_count"]        = randomTreeCount.ToString(),
+            ["houndmaster_axe"]          = b(houndmasterAxe),
             ["allow_midgame_spectators"] = b(allowMidgameSpectators),
             ["keep_lobby_joinable"]      = b(keepLobbyJoinable),
             ["host_settings_sync"]       = b(hostSettingsSync),
