@@ -43,6 +43,19 @@ powershell -NoProfile -Command ^
   "  Write-Host '  WARNING: dll\dllmain.cpp is newer than dll\openal32.dll.' -ForegroundColor Yellow;" ^
   "  Write-Host '           Run dll\build2.bat first if the native mod changed.' -ForegroundColor Yellow }"
 
+rem ---- refuse to ship the dev test harness ----
+rem A plain dll\build2.bat includes it when _local\harness\testharness.h exists (on a dev
+rem machine). Releases must be built with "dll\build2.bat release". The harness's script
+rem file name only appears in the dll when the harness is compiled in.
+for %%F in ("%DLLDIR%\openal32.dll" "%MANAGER%\VUltra.dll") do (
+  if exist "%%~F" findstr /m /c:"vultra_test.txt" "%%~F" >nul && (
+    echo.
+    echo  %%~F contains the test harness.
+    echo  Rebuild with "dll\build2.bat release" and copy it to manager\VUltra.dll, then rerun.
+    pause & exit /b 1
+  )
+)
+
 echo.
 echo === [1/4] Building self-contained manager exe (large, please wait) ===
 dotnet publish "%MANAGER%\VUltraManager.csproj" -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o "%MANAGER%\publish-sc"

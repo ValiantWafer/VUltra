@@ -2065,9 +2065,11 @@ __declspec(naked) static void det_hurt() {
 typedef void (__fastcall *clientStep_t)(void* self, void* edx);
 static clientStep_t g_stepTramp = nullptr;
 static void flush_enemy_dups(void* ge);   // defined below (enemy-duplication section)
+static void test_frame(void* client);     // testharness.h: runs one step of a test script (inert without one)
 static void __cdecl step_frame(void* client) {
     reload_if_ini_changed();   // pick up manager "Save" live (e.g. in the lobby) -> re-syncs mage options
     if (client) g_ge = reinterpret_cast<uint8_t*>(client) + OFF_CLIENT_GE;
+    test_frame(client);
     flush_enemy_dups(g_ge);    // spawn any queued enemy copies into the live level (deferred, safe here)
     // Difficulty model (self-driven; NO newGame hook — that crashed). Loop number = g_loopCount + 1:
     // NG+ turns on at loop # start_difficulty, the extra monster scaling at loop # scaling_starts_at
@@ -2917,6 +2919,16 @@ __declspec(naked) static void det_log_loadNext() {
 #endif
 
 // ---- installer ----------------------------------------------------------
+// Scripted test driver for development. It lives in the private dev repo (cloned into the
+// gitignored _local/), so public builds compile these no-op stubs instead. `build2.bat release`
+// defines VULTRA_NO_TEST_HARNESS to leave it out even where the file exists.
+#if !defined(VULTRA_NO_TEST_HARNESS) && __has_include("../_local/harness/testharness.h")
+#include "../_local/harness/testharness.h"
+#else
+static void test_frame(void*) {}
+static void test_harness_install() {}
+#endif
+
 static bool install_hook() {
     char exePath[MAX_PATH]; GetModuleFileNameA(GetModuleHandleW(nullptr), exePath, MAX_PATH);
     const char* exeName = strrchr(exePath, '\\'); exeName = exeName ? exeName + 1 : exePath;
@@ -3126,6 +3138,7 @@ static bool install_hook() {
             install_detour(RVA_CLIENT_STEP, (void*)&det_step, 5, step_pro, 5));
         logmsg("[vultra] loop step-hook %s (test_warp=%d, start_floor=%d)",
                g_stepTramp ? "installed" : "FAILED", g_loopTestWarp, g_loopStartFloor);
+        if (g_stepTramp) test_harness_install();   // needs the step hook to drive the script
         // MP host: hook Server::step entry (liveness + F11 request).
         g_serverStepTramp = reinterpret_cast<serverStep_t>(
             install_detour(RVA_SERVER_STEP, (void*)&det_server_step, 5, step_pro, 5));
