@@ -192,6 +192,7 @@ static inline uint32_t rng_next() {
 // stored in the item's randIndex; every later setSkill (load, pickup, setEntityState)
 // re-applies that stored value verbatim -> drop & re-grab keeps the same spell.
 static void reload_if_ini_changed();   // defined below
+static void apply_random_tree_count(); // defined below
 
 // Replacement for the rolled skill: a uniform pick from the enabled pool.
 static int __cdecl pick_pool_skill(int rolled) {
@@ -367,6 +368,14 @@ static volatile bool g_randWeaponMatch = false;  // [player] random_match_weapon
 static volatile bool g_randNoTreeDefault = true; // [player] random_no_tree_default: no weapon tree -> default weapon (off = fists)
 static volatile bool g_randArcheryBow = true;    // [player] random_archery_bow: Archery skill tree also grants a bow + 30 arrows
 static volatile bool g_randHealth = false;       // [player] random_health: Random char starts with a randomized max HP (60..100)
+// [player] random_tree_count: how many skill trees (affinities) a Random character rolls. Stock is a
+// hardcoded 4 in PlayerMenu::randomizeAffinities (it shuffles a 16-entry pool of distinct affinity
+// types -- 0,1,2,3,5,11,12,13,14,15,16,18,19,20,21,25 -- and takes the first N). We rewrite that site,
+// so 0..16 is valid. The roll happens on the machine of the player who picks Random, using THAT
+// machine's ini; the rolled list is then sent to the host (Client::sendInputToServer: count byte +
+// one byte per type), and the character is built from the list on both machines. For 0 trees see
+// AFFINITY_NO_TREES below. The character-select UI is laid out for 4 slots (>4 is cosmetic only).
+static volatile int g_randomTreeCount = 4;
 
 // ---- Multiplayer: never stop new players from joining (and spectating) mid-game ----------
 // Server::onClientBeginAuthentication has two overloads (the host picks one via byte[Server+0x78]).
@@ -386,6 +395,8 @@ static volatile bool g_midgameSpectators = false;  // [multiplayer] allow_midgam
 // host always advertises "joinable"="1". Host-side + respects the host's public/friends privacy
 // (SetLobbyType is unchanged); a genuinely full lobby still answers "Server is full." on join.
 static volatile bool g_keepLobbyJoinable = false;  // [multiplayer] keep_lobby_joinable
+static volatile bool g_portalCoop = true;          // [multiplayer] portal_coop (declared early; used in load_config)
+static volatile bool g_portalTwoWay = false;       // [multiplayer] portal_two_way (both ends interactable, teleport to the opposite end)
 static void* g_specPathA1 = nullptr;   // overload1 assign-free-slot entry (g_base + 0x36b3dd)
 static void* g_specPathA2 = nullptr;   // overload2 assign-free-slot entry (g_base + 0x36bc52)
 static volatile long g_specLogged1 = 0, g_specLogged2 = 0;
@@ -841,8 +852,13 @@ static void load_config() {
     g_randNoTreeDefault = GetPrivateProfileIntA("player", "random_no_tree_default", 1, g_iniPath) != 0;  // 1=default weapon, 0=fists
     g_randArcheryBow = GetPrivateProfileIntA("player", "random_archery_bow", 1, g_iniPath) != 0;  // Archery tree -> +bow +30 arrows
     g_randHealth = GetPrivateProfileIntA("player", "random_health", 0, g_iniPath) != 0;  // random max HP 60..100 for Random chars
+    g_randomTreeCount = (int)GetPrivateProfileIntA("player", "random_tree_count", 4, g_iniPath);  // # skill trees a Random char rolls (stock 4)
+    if (g_randomTreeCount < 0)  g_randomTreeCount = 0;
+    if (g_randomTreeCount > 16) g_randomTreeCount = 16;   // candidate pool is 16 distinct affinity types
     g_midgameSpectators = GetPrivateProfileIntA("multiplayer", "allow_midgame_spectators", 0, g_iniPath) != 0;  // applied at startup (host)
     g_keepLobbyJoinable = GetPrivateProfileIntA("multiplayer", "keep_lobby_joinable", 0, g_iniPath) != 0;       // applied at startup (host)
+    g_portalCoop = GetPrivateProfileIntA("multiplayer", "portal_coop", 1, g_iniPath) != 0;  // any player can use placed portals (both need the mod); live-toggleable
+    g_portalTwoWay = GetPrivateProfileIntA("multiplayer", "portal_two_way", 0, g_iniPath) != 0;  // interact on either portal end to teleport to the other; live-toggleable
     g_wandSkillTree    = GetPrivateProfileIntA("mage", "wand_skill_tree",    0, g_iniPath) != 0;  // applied at startup
     g_randomWandWeapon = GetPrivateProfileIntA("mage", "random_wand_weapon", 0, g_iniPath) != 0;  // applied at startup
     g_wandZeroCharges  = GetPrivateProfileIntA("mage", "wand_zero_charges",  0, g_iniPath) != 0;  // applied at startup
@@ -858,6 +874,7 @@ static void reload_if_ini_changed() {
     load_config();
     apply_widening_if_needed();
     sync_mage_patches();                 // re-apply/revert the mage Rod<->Wand options to match the ini
+    apply_random_tree_count();           // re-apply the Random-character skill-tree count
     logmsg("[vultra] config reloaded live; pool size %d", g_poolN);
 }
 
@@ -1176,6 +1193,242 @@ __declspec(naked) static void det_bonfireHeal() {
     }
 }
 
+// ---- Co-op portal fix: let any player use a placed portal -----------------
+// The Portal spellbook places two networked SpellEntities: SPELL_PORTAL_ENTRANCE(2) and
+// SPELL_PORTAL(1). SpellEntity::enterPortal teleports the entering entity to the EXIT, reading the
+// destination from the CASTING player's fields Player.portal(+0x7878) and Player.portalEntrance
+// (+0x7880). Those two Player fields are NOT network-synced (absent from Snapshot::writeDeltaEntity),
+// so on every machine except the caster's they are null. enterPortal then takes its "no destination"
+// branch: it still swaps the portal art (a replicated entity-state toggle) but skips the move. Net
+// result the player reported: only the caster teleports; for everyone else the art flips but nobody
+// moves.
+//   Both portal endpoints ARE replicated (the SpellEntity ctor sets Entity.networked=1) and each one
+// resolves its owner pointer (+0x218) on every machine. So on whatever machine runs the teleport we
+// can rebuild the missing link from the live entity list: scan Level.entities for the two portal
+// SpellEntities owned by this portal's owner and borrow them into owner.portal / owner.portalEntrance
+// just for the duration of the original call, then restore. The borrow uses raw pointers and touches
+// no refcounts: the entities are kept alive by the level's own strong references, and stock
+// enterPortal makes its own ref-counted copies of the link while it runs. With the link present the
+// unmodified enterPortal teleports whoever entered, on host and client alike. Both players need the
+// mod (the teleport runs authoritatively on the host AND is predicted on the entering client).
+static volatile DWORD g_lastServerStep = 0;   // updated every Server::step; recent => this instance is the MP host
+static const uintptr_t RVA_ENTER_PORTAL    = 0x003a48a0;  // SpellEntity::enterPortal(shared_ptr<Entity>)
+static const uintptr_t RVA_SPELLENTITY_VFT = 0x0071ef58;  // ??_7SpellEntity@@6B@ (identifies a SpellEntity)
+static const size_t OFF_ENT_OWNER        = 0x218;   // SpellEntity owner shared_ptr (raw ptr; ctrl at +0x21c)
+static const size_t OFF_ENT_SPELLTYPE    = 0x224;   // SpellEntity::SpellType (1=PORTAL exit, 2=PORTAL_ENTRANCE)
+static const size_t OFF_ENT_LEVEL        = 0x1a0;   // Entity::level (Level*)
+static const size_t OFF_PLAYER_PORTAL    = 0x7878;  // Player.portal          shared_ptr<SpellEntity> (the exit)
+static const size_t OFF_PLAYER_PORTALENT = 0x7880;  // Player.portalEntrance  shared_ptr<SpellEntity> (the entrance)
+static const size_t OFF_LEVEL_ENTITIES   = 0xfd0;   // Level.entities  vector<shared_ptr<Entity>> (8-byte elems)
+static const int SPELLTYPE_PORTAL          = 1;     // the EXIT endpoint
+static const int SPELLTYPE_PORTAL_ENTRANCE = 2;     // the ENTRANCE endpoint
+// g_portalCoop is declared up with the other [multiplayer] flags (load_config reads it before here).
+
+typedef void (__fastcall *enterPortal_t)(void* self, void* edx, void* spPtr, void* spCtrl);
+static enterPortal_t g_enterPortalTramp = nullptr;
+
+// The Player link slots we temporarily filled, so we can put them back after the stock call.
+struct PortalBorrow { void** slot[2]; void* saved[2][2]; int n; };
+
+static bool portal_link_borrow(void* self, PortalBorrow* b) {
+    b->n = 0;
+    if (!g_portalCoop || !self) return false;
+    uint8_t* ent = reinterpret_cast<uint8_t*>(self);
+    void* spellVft = reinterpret_cast<void*>(g_base + RVA_SPELLENTITY_VFT);
+    if (*reinterpret_cast<void**>(ent) != spellVft) return false;            // not a SpellEntity
+    uint8_t* owner = *reinterpret_cast<uint8_t**>(ent + OFF_ENT_OWNER);
+    if (!owner) return false;
+    void** pPortal   = reinterpret_cast<void**>(owner + OFF_PLAYER_PORTAL);     // {ptr, ctrl}
+    void** pEntrance = reinterpret_cast<void**>(owner + OFF_PLAYER_PORTALENT);  // {ptr, ctrl}
+    if (pPortal[0] && pEntrance[0]) return false;   // already linked (caster's machine): nothing to do
+    uint8_t* level = *reinterpret_cast<uint8_t**>(ent + OFF_ENT_LEVEL);
+    if (!level) return false;
+    // Level::entities (+0xfd0) is a POINTER to a std::vector<shared_ptr<Entity>> (12 bytes: begin/end/cap),
+    // NOT an inline vector. Dereference once to reach the vector, then read begin/end.
+    uint8_t* entvec = *reinterpret_cast<uint8_t**>(level + OFF_LEVEL_ENTITIES);
+    if (!entvec) return false;
+    void** vbegin = *reinterpret_cast<void***>(entvec + 0);
+    void** vend   = *reinterpret_cast<void***>(entvec + 4);
+    if (!vbegin || vend < vbegin) return false;
+    void* exitPtr = nullptr, *exitCtrl = nullptr, *entrPtr = nullptr, *entrCtrl = nullptr;
+    for (void** it = vbegin; it < vend; it += 2) {       // 8-byte shared_ptr elements: {raw, ctrl}
+        uint8_t* e = reinterpret_cast<uint8_t*>(it[0]);
+        if (!e) continue;
+        if (*reinterpret_cast<void**>(e) != spellVft) continue;                 // SpellEntity only
+        if (*reinterpret_cast<void**>(e + OFF_ENT_OWNER) != owner) continue;    // same caster
+        int type = *reinterpret_cast<int*>(e + OFF_ENT_SPELLTYPE);
+        if      (type == SPELLTYPE_PORTAL)          { exitPtr = it[0]; exitCtrl = it[1]; }
+        else if (type == SPELLTYPE_PORTAL_ENTRANCE) { entrPtr = it[0]; entrCtrl = it[1]; }
+    }
+    if (!pPortal[0] && exitPtr) {
+        b->slot[b->n] = pPortal;   b->saved[b->n][0] = pPortal[0];   b->saved[b->n][1] = pPortal[1];
+        pPortal[0] = exitPtr;      pPortal[1] = exitCtrl;            b->n++;
+    }
+    if (!pEntrance[0] && entrPtr) {
+        b->slot[b->n] = pEntrance; b->saved[b->n][0] = pEntrance[0]; b->saved[b->n][1] = pEntrance[1];
+        pEntrance[0] = entrPtr;    pEntrance[1] = entrCtrl;          b->n++;
+    }
+    return b->n > 0;
+}
+static void portal_link_restore(PortalBorrow* b) {
+    for (int i = 0; i < b->n; i++) { b->slot[i][0] = b->saved[i][0]; b->slot[i][1] = b->saved[i][1]; }
+    b->n = 0;
+}
+// Swap the {x,y} positions of the two portal endpoints (mirrors the caster-only owner-branch swap in
+// stock enterPortal). Entity position is at +0xac (x) / +0xb0 (y).
+static void portal_swap_positions(void* a, void* c) {
+    if (!a || !c || a == c) return;
+    float* ax = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(a) + 0xac);  // x
+    float* ay = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(a) + 0xb0);  // y
+    float* cx = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(c) + 0xac);
+    float* cy = reinterpret_cast<float*>(reinterpret_cast<uint8_t*>(c) + 0xb0);
+    float t;
+    t = *ax; *ax = *cx; *cx = t;
+    t = *ay; *ay = *cy; *cy = t;
+}
+// Pre-hook: supply the missing entrance<->exit link (when this isn't the caster's machine), run the
+// stock teleport, then put the borrowed Player fields back. A rare same-owner concurrent use (server
+// thread + main thread) can null the borrow mid-call: the worst case is one missed teleport, retried
+// on the next press. No refcounts are touched, so the borrowed entities can never be freed underneath.
+//
+// Stock enterPortal only swaps the entrance<->exit positions when the CASTER uses the portal (owner
+// branch); a teammate just teleports. To keep co-op behaviour identical to solo, when a teammate uses
+// the portal we perform that swap ourselves -- but only on the MP HOST (the portals are host-owned, so
+// the swap must be authoritative to sync to everyone) and only once per use (a short per-portal cooldown
+// absorbs the collision-driven repeat calls while the player still overlaps).
+static void* g_lastSwapPortal = nullptr;
+static DWORD g_lastSwapTime   = 0;
+static void __fastcall det_enterPortal(void* self, void* edx, void* spPtr, void* spCtrl) {
+    if (!g_enterPortalTramp) return;
+    PortalBorrow b;
+    bool borrowed = portal_link_borrow(self, &b);
+    // Capture the two endpoints + the teammate/host decision while the link is valid (borrow filled it).
+    uint8_t* owner = self ? *reinterpret_cast<uint8_t**>(reinterpret_cast<uint8_t*>(self) + OFF_ENT_OWNER) : nullptr;
+    bool teammate  = owner && spPtr && spPtr != owner;
+    bool isHost    = (GetTickCount() - g_lastServerStep) < 500;   // Server::step ran recently => MP host
+    void** pPortalSlot = owner ? reinterpret_cast<void**>(owner + OFF_PLAYER_PORTAL) : nullptr;      // {ptr, ctrl}
+    void** pEntrSlot   = owner ? reinterpret_cast<void**>(owner + OFF_PLAYER_PORTALENT) : nullptr;   // {ptr, ctrl}
+    void* pExit = pPortalSlot ? pPortalSlot[0] : nullptr;   // stock teleport destination is always owner.portal
+    void* pEntr = pEntrSlot   ? pEntrSlot[0]   : nullptr;
+    // Two-way: stock always sends you to owner.portal (the exit). If two-way is on and you entered the
+    // EXIT end, point owner.portal at the ENTRANCE for this call so you teleport to the opposite end.
+    // Restored right after the stock call (independent of the borrow, which may not own this slot).
+    bool redir = false; void* savedPortal[2] = { nullptr, nullptr };
+    if (g_portalTwoWay && pPortalSlot && pEntrSlot && pExit && pEntr && self == pExit) {
+        savedPortal[0] = pPortalSlot[0]; savedPortal[1] = pPortalSlot[1];
+        pPortalSlot[0] = pEntrSlot[0];   pPortalSlot[1] = pEntrSlot[1];
+        redir = true;
+    }
+    g_enterPortalTramp(self, edx, spPtr, spCtrl);   // stock teleport (now it sees the link)
+    if (redir) { pPortalSlot[0] = savedPortal[0]; pPortalSlot[1] = savedPortal[1]; }
+    if (g_portalCoop && isHost && teammate && pExit && pEntr && pExit != pEntr) {
+        DWORD now = GetTickCount();
+        if (self != g_lastSwapPortal || now - g_lastSwapTime > 500) {   // once per fresh use
+            portal_swap_positions(pExit, pEntr);
+            g_lastSwapPortal = self;
+            g_lastSwapTime   = now;
+        }
+    }
+    if (borrowed) portal_link_restore(&b);
+}
+
+// ---- Two-way portal: make the EXIT end interactable too ------------------
+// Player::doCollision registers the touched portal as the interactable one (Player+0x7798) ONLY for
+// SpellType 2 (PORTAL_ENTRANCE); the exit (type 1) is skipped, so you can only press interact on the
+// entrance. The site is `cmp [ebp-0x20], 2 ; jne 0x6f839d` at 0x2f7d14/0x2f7d18. We overwrite the jne
+// with a jump to this naked handler: with two_way on it registers type 1 OR 2; off, it reproduces the
+// stock "type 2 only" behaviour (so the patch is safe to install unconditionally + live-toggle).
+static const uintptr_t RVA_PORTAL_INTERACT_JNE = 0x002f7d18;  // jne 0x6f839d (0F 85 7F 06 00 00)
+static uintptr_t g_portalRegVA  = 0;   // 0x2f7d1e: fall-through that stores Player+0x7798 = this portal
+static uintptr_t g_portalSkipVA = 0;   // 0x2f839d: not a portal to register
+__declspec(naked) static void det_portalInteract() {
+    __asm {
+        cmp  byte ptr g_portalTwoWay, 0
+        jne  two_way
+        cmp  dword ptr [ebp-0x20], 2        // stock: entrance only
+        je   go_reg
+        jmp  go_skip
+    two_way:
+        cmp  dword ptr [ebp-0x20], 1        // exit
+        je   go_reg
+        cmp  dword ptr [ebp-0x20], 2        // entrance
+        je   go_reg
+    go_skip:
+        jmp  dword ptr [g_portalSkipVA]
+    go_reg:
+        jmp  dword ptr [g_portalRegVA]
+    }
+}
+static bool install_portal_twoway() {
+    uint8_t* p = reinterpret_cast<uint8_t*>(g_base + RVA_PORTAL_INTERACT_JNE);
+    static const uint8_t expect[6] = {0x0F, 0x85, 0x7F, 0x06, 0x00, 0x00};   // jne 0x6f839d
+    if (memcmp(p, expect, 6) != 0) { logmsg("[vultra] portal two-way: byte mismatch, skipped"); return false; }
+    g_portalRegVA  = g_base + 0x002f7d1e;
+    g_portalSkipVA = g_base + 0x002f839d;
+    DWORD oldp;
+    if (!VirtualProtect(p, 6, PAGE_EXECUTE_READWRITE, &oldp)) return false;
+    p[0] = 0xE9;
+    *reinterpret_cast<int32_t*>(p + 1) = static_cast<int32_t>(reinterpret_cast<uint8_t*>(&det_portalInteract) - (p + 5));
+    p[5] = 0x90;
+    VirtualProtect(p, 6, oldp, &oldp);
+    FlushInstructionCache(GetCurrentProcess(), p, 6);
+    return true;
+}
+
+// ---- Random character skill-tree count ----------------------------------
+// PlayerMenu::randomizeAffinities shuffles a 16-entry pool of affinity types and copies the first N
+// into the rolled loadout via `mov esi, 4` (BE 04 00 00 00). We rewrite that imm8 to g_randomTreeCount.
+// Idempotent (only the immediate changes; the 0xBE opcode is the guard), so it is safe to re-apply on
+// live ini reload. The pool is 16 distinct, so 1..16 never reads past the array.
+static const uintptr_t RVA_RANDOMIZE_AFFINITIES = 0x0031dfe0;  // PlayerMenu::randomizeAffinities (thiscall, no args)
+static const uintptr_t RVA_RANDOM_TREE_COUNT    = 0x0031e3e4;  // `mov esi, 4` (BE 04 00 00 00) in PlayerMenu::randomizeAffinities
+static const uintptr_t RVA_POPULATE_AFFINITIES  = 0x0030a8c0;  // PlayerCustomizer::populateAffinities (cdecl)
+static const size_t    OFF_MENU_ROLLED_AFFS     = 0x33bc;      // PlayerMenu: vector<AffinityType> rolled list (begin/end/cap)
+// The take-N copy loop right after this is a do-while, so a raw `mov esi, 0` would underflow (esi--
+// from 0) and run ~4 billion times -> crash. And an EMPTY rolled list is no good either: the
+// character-build path (initializePlayer) treats an empty custom affinity list as "fixed class" and
+// falls back to the class-default trees (setStartingAffinities). So for 0 trees we still roll ONE
+// entry here (`mov esi, 1`) to keep the list non-empty -> the build takes the populate branch (no
+// class defaults). det_randomizeAffinities then overwrites that entry with the AFFINITY_NO_TREES
+// marker, and det_populateAffinities drops every marker, so zero real trees land.
+//   The marker lives IN the list, so the decision travels with the character (the list is what the
+// client sends to the host). Every machine that builds the character strips it the same way, whatever
+// its own random_tree_count says. Before, each machine decided from its own ini, so a host set to 0
+// wiped every Random client's trees, and a client set to 0 showed up on the host with 1 tree.
+//   Type 17 is never in the roll pool, and it's a real type (the hidden baseline affinity that
+// populateAffinities appends five of), so an unmodded machine that receives the marker builds one
+// extra hidden baseline instead of crashing (Affinity::getNewAffinity has a case for 0..25).
+static const int AFFINITY_NO_TREES = 17;
+static void apply_random_tree_count() {
+    uint8_t* p = reinterpret_cast<uint8_t*>(g_base + RVA_RANDOM_TREE_COUNT);
+    // Accept the stock site (mov esi, imm32) or our own prior rewrite (mov esi, n / legacy jmp-skip).
+    bool known = (p[0] == 0xBE && p[3] == 0x00 && p[4] == 0x00) || (p[0] == 0xEB && p[1] == 0x2D);
+    if (!known) { logmsg("[vultra] random-tree-count site mismatch (op=0x%02x)", p[0]); return; }
+    int n = g_randomTreeCount;
+    if (n < 0) n = 0; if (n > 16) n = 16;           // pool is 16 distinct affinity types (0..15)
+    uint8_t cnt = (n == 0) ? 1 : (uint8_t)n;         // 0 rolls 1 placeholder; det_randomizeAffinities marks it
+    uint8_t want[5] = { 0xBE, cnt, 0x00, 0x00, 0x00 };   // mov esi, cnt
+    if (memcmp(p, want, 5) == 0) return;            // already set
+    DWORD oldp;
+    if (!VirtualProtect(p, 5, PAGE_EXECUTE_READWRITE, &oldp)) return;
+    memcpy(p, want, 5);
+    VirtualProtect(p, 5, oldp, &oldp);
+    FlushInstructionCache(GetCurrentProcess(), p, 5);
+    logmsg("[vultra] random skill-tree count = %d", n);
+}
+
+// Post-hook on the roll: with random_tree_count == 0 the list holds the single placeholder entry
+// (see above). Overwrite it with the AFFINITY_NO_TREES marker. If the count was changed between the
+// patch and this roll, the list length won't be 1, so we leave it alone.
+typedef void (__fastcall *randomizeAff_t)(void* self, void* edx);
+static randomizeAff_t g_randomizeAffTramp = nullptr;
+static void __fastcall det_randomizeAffinities(void* self, void* edx) {
+    g_randomizeAffTramp(self, edx);
+    if (g_randomTreeCount != 0 || !self) return;
+    int** vec = reinterpret_cast<int**>(reinterpret_cast<uint8_t*>(self) + OFF_MENU_ROLLED_AFFS);
+    if (vec[0] && vec[1] == vec[0] + 1) vec[0][0] = AFFINITY_NO_TREES;
+}
+
 // ---- New Game Plus / "The Cycle" looping --------------------------------
 // GameSave::initGameState(GameEngine*) const: thiscall, ecx=this(GameSave). It reads
 // this->m_newGamePlus and, when set, applies the harder NG+ scaling. We force the flag
@@ -1247,7 +1500,7 @@ static void __declspec(noinline) call_server_loadNextLevel(void* server) {
 // still falls back to the client-side warp. (The boss-win LOOP path does not use this flag; it calls
 // server_loop_now directly from the win detection.)
 static volatile LONG g_mpWarpRequest = 0;
-static volatile DWORD g_lastServerStep = 0;
+// g_lastServerStep defined earlier (near the portal hook) so det_enterPortal can read it.
 // Boss-defeat loop handshake: instead of letting the final boss trigger its ending cutscene (which
 // sets Level::endOfCampaign and syncs the win to every client -> credits), the Cutscene::trigger hook
 // SKIPS the FINAL_BOSS_DEFEATED[_FINAL_FORM] cutscene and sets this flag. The boss never "wins" the
@@ -2046,6 +2299,29 @@ static void give_bow_and_arrows(void* player) {
 }
 typedef void (__cdecl *setStartItems_t)(void* spPtr, void* spCtrl);
 static setStartItems_t g_setStartItemsTramp = nullptr;
+
+// PlayerCustomizer::populateAffinities(shared_ptr<Player>, vector<AffinityType>) -- __cdecl, both args
+// BY VALUE: 5 dwords {player, ctrl, begin, end, cap}, and the callee releases the shared_ptr and frees
+// the vector (the caller does `add esp, 0x14`). It adds one affinity per list entry, then appends the
+// fixed baseline affinities. This runs ONLY for characters with a non-empty custom affinity list (i.e.
+// Random characters); fixed classes take setStartingAffinities instead and never reach here.
+//   We drop every AFFINITY_NO_TREES marker from the list (compacting in place; the vector is ours to
+// edit and is freed by begin/cap, which we don't touch). A 0-tree roll arrives as exactly one marker,
+// so zero rolled trees land and the character keeps only the baselines. This keys off the list, not
+// the local ini, so host and client build the same character. Lists without a marker pass untouched.
+//   All 5 dwords are forwarded. An earlier 4-arg version left `cap` as whatever was on our stack, and
+// the stock code frees the vector using that value.
+typedef void (__cdecl *populateAff_t)(void* player, void* ctrl, int* begin, int* end, int* cap);
+static populateAff_t g_populateAffTramp = nullptr;
+static void __cdecl det_populateAffinities(void* player, void* ctrl, int* begin, int* end, int* cap) {
+    if (begin && end > begin) {
+        int* out = begin;
+        for (int* it = begin; it < end; ++it)
+            if (*it != AFFINITY_NO_TREES) *out++ = *it;
+        end = out;
+    }
+    g_populateAffTramp(player, ctrl, begin, end, cap);
+}
 // Random-class wands can be created by ANY class branch (knight/rogue/... whose weapon we swapped to a
 // wand), not just the mage branch, so the mage byte-patch that zeroes charges doesn't reach them. When
 // g_wandZeroCharges is on, zero the equipped weapon's charges here if a Random char ended up holding a
@@ -2460,6 +2736,33 @@ static bool install_hook() {
         // levelgen+0x50 check). Hooking newGame for it crashed, so that approach was dropped.
         logmsg("[vultra] difficulty (self-driven in step) start_difficulty=%d scaling_starts_at=%d harderBy=%.1f%%",
                g_startDifficulty, g_scalingStartsAt, g_harderByPct);
+    }
+    // Co-op portals: hook SpellEntity::enterPortal so a placed portal teleports whoever enters it,
+    // not just the caster (rebuilds the un-synced entrance<->exit link from the replicated entities).
+    // Installed unconditionally; gated live by g_portalCoop (ini [multiplayer] portal_coop).
+    {
+        const uint8_t ep_pro[5] = {0x55, 0x8B, 0xEC, 0x6A, 0xFF};  // push ebp; mov ebp,esp; push -1
+        g_enterPortalTramp = reinterpret_cast<enterPortal_t>(
+            install_detour(RVA_ENTER_PORTAL, (void*)&det_enterPortal, 5, ep_pro, 5));
+        logmsg("[vultra] coop-portal hook %s (portal_coop=%d)",
+               g_enterPortalTramp ? "installed" : "FAILED", g_portalCoop);
+        // Two-way portal: make both ends interactable (behaviour gated live by g_portalTwoWay).
+        logmsg("[vultra] portal two-way hook %s (portal_two_way=%d)",
+               install_portal_twoway() ? "installed" : "FAILED", g_portalTwoWay);
+    }
+    // Random character skill-tree count: rewrite the hardcoded 4 in randomizeAffinities.
+    apply_random_tree_count();
+    // Companion hooks so random_tree_count == 0 yields truly zero trees (not the class defaults):
+    // mark the 0-tree placeholder after the roll, and strip markers when the character is built.
+    // Lists without a marker pass through untouched.
+    {
+        const uint8_t pro[5] = {0x55, 0x8B, 0xEC, 0x6A, 0xFF};  // push ebp; mov ebp,esp; push -1
+        g_randomizeAffTramp = reinterpret_cast<randomizeAff_t>(
+            install_detour(RVA_RANDOMIZE_AFFINITIES, (void*)&det_randomizeAffinities, 5, pro, 5));
+        logmsg("[vultra] randomize-affinities hook %s", g_randomizeAffTramp ? "installed" : "FAILED");
+        g_populateAffTramp = reinterpret_cast<populateAff_t>(
+            install_detour(RVA_POPULATE_AFFINITIES, (void*)&det_populateAffinities, 5, pro, 5));
+        logmsg("[vultra] populate-affinities hook %s", g_populateAffTramp ? "installed" : "FAILED");
     }
     // Same-character loop: hook Client::step to capture the live GameEngine and (when the test
     // toggle is on) warp-restart on F11. The warp uses the devs' own debug primitive
