@@ -63,8 +63,11 @@ public class MainForm : Form
         Text = "V Ultra";
         BackColor = Bg; ForeColor = Fg;
         Font = new Font("Segoe UI", 9f);
-        // Scale the absolute (pixel-positioned) layout by the actual DPI ratio. The default
-        // Font-based autoscale drifts on manual layouts and crowds controls on high-DPI screens.
+        // DPI: every position and size in BuildUi is written in 96-DPI ("100%") units, and
+        // ScaleLayout multiplies them by DeviceDpi/96 at the end of the constructor. At that point
+        // DeviceDpi is the primary monitor's. If the window then opens on (or is dragged to) a monitor
+        // with a different DPI, WinForms rescales from there (AutoScaleMode.Dpi), so it's right
+        // everywhere. Fonts are in points, so they already render at the real DPI.
         AutoScaleMode = AutoScaleMode.Dpi;
         ClientSize = new Size(660, 840);
         FormBorderStyle = FormBorderStyle.Sizable;
@@ -73,6 +76,58 @@ public class MainForm : Form
         StartPosition = FormStartPosition.CenterScreen;
         BuildUi();
         Detect();
+        ScaleLayout(DeviceDpi / 96f);
+    }
+
+    // Multiply the 96-DPI layout by f: the form's size limits, and every control's position, size
+    // (auto-sized ones keep their measured size), margins, padding and fixed table rows/columns.
+    void ScaleLayout(float f)
+    {
+        if (Math.Abs(f - 1f) < 0.01f) return;
+        int R(float v) => (int)Math.Round(v * f);
+        Size Sz(Size z) => new(R(z.Width), R(z.Height));
+        Padding Pd(Padding p) => new(R(p.Left), R(p.Top), R(p.Right), R(p.Bottom));
+        void Walk(Control parent)
+        {
+            if (parent is TableLayoutPanel t)
+            {
+                foreach (RowStyle rs in t.RowStyles) if (rs.SizeType == SizeType.Absolute) rs.Height = R(rs.Height);
+                foreach (ColumnStyle cs in t.ColumnStyles) if (cs.SizeType == SizeType.Absolute) cs.Width = R(cs.Width);
+            }
+            foreach (Control c in parent.Controls)
+            {
+                if (c.Dock == DockStyle.None)          // docked controls are sized by their parent
+                {
+                    c.Location = new Point(R(c.Left), R(c.Top));
+                    if (!c.AutoSize) c.Size = Sz(c.Size);
+                    else if (c is TextBoxBase) c.Width = R(c.Width);   // auto-sizes its height only
+                }
+                c.Margin = Pd(c.Margin);
+                c.Padding = Pd(c.Padding);
+                if (c.MaximumSize != Size.Empty) c.MaximumSize = Sz(c.MaximumSize);
+                Walk(c);
+            }
+        }
+        var client = Sz(ClientSize);
+        SuspendLayout();
+        Walk(this);
+        ResumeLayout(true);
+        MinimumSize = Sz(MinimumSize);
+        ClientSize = client;               // set last, after the children are scaled
+    }
+
+    // After DPI scaling the window can be taller (or wider) than the screen, e.g. 840 rows at 150%
+    // is 1260 pixels. Shrink it to the monitor's work area and re-center; the sections scroll.
+    protected override void OnLoad(EventArgs e)
+    {
+        base.OnLoad(e);
+        var area = Screen.FromControl(this).WorkingArea;
+        int w = Math.Min(Width, area.Width), h = Math.Min(Height, area.Height);
+        if (w != Width || h != Height)
+        {
+            Size = new Size(w, h);
+            Location = new Point(area.Left + (area.Width - w) / 2, area.Top + (area.Height - h) / 2);
+        }
     }
 
     // Every option section lives in a CollapsibleSection so it can be folded away. They are stacked
@@ -80,7 +135,7 @@ public class MainForm : Form
     void BuildUi()
     {
         var root = new TableLayoutPanel { Dock = DockStyle.Fill, ColumnCount = 1, RowCount = 3, BackColor = Bg };
-        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 62));   // path
+        root.RowStyles.Add(new RowStyle(SizeType.Absolute, 68));   // path
         root.RowStyles.Add(new RowStyle(SizeType.Percent, 100));   // sections
         root.RowStyles.Add(new RowStyle(SizeType.Absolute, 140));  // footer
 
@@ -108,9 +163,9 @@ public class MainForm : Form
 
         int x0 = 22, subX = x0 + 20;
         // Place an input control just past the rendered right edge of its label, so longer labels
-        // never get shoved into. Uses the label's real PreferredWidth (once parented it matches how
-        // it actually renders at the current DPI) instead of a predicted text measurement.
-        int After(Label l, int gap = 14) => l.Location.X + l.PreferredWidth + gap;
+        // never get shoved into. PreferredWidth is measured at the real DPI, but positions here are
+        // 96-DPI units that ScaleLayout scales afterwards, so convert the measured width to 96-DPI units.
+        int After(Label l, int gap = 14) => l.Location.X + l.PreferredWidth * 96 / DeviceDpi + gap;
 
         // ===== STANDARD SPELLBOOK SPELLS =====
         {
@@ -457,7 +512,7 @@ public class MainForm : Form
             body.Controls.Add(_warpLabel);
             _warpCombo = new ComboBox {
                 DropDownStyle = ComboBoxStyle.DropDownList, FlatStyle = FlatStyle.Flat,
-                BackColor = Panel, ForeColor = Fg, Width = 160, Location = new Point(x0 + 110, warpY), Visible = false };
+                BackColor = Panel, ForeColor = Fg, Width = 160, Location = new Point(After(_warpLabel), warpY), Visible = false };
             _warpCombo.Items.AddRange(LevelNames());
             _warpCombo.SelectedIndex = 0;
             Tip(_warpCombo, warpTip);

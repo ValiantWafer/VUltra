@@ -47,5 +47,10 @@ public sealed class CollapsibleSection : Panel
     }
 
     void UpdateHeader() => _header.Text = (_expanded ? "▼  " : "▶  ") + _title;
-    void Relayout() => Height = HeaderH + (_expanded ? Body.Height : 0);
+    // Use the header's live height, not HeaderH: DPI scaling enlarges the header on load.
+    void Relayout()
+    {
+        Body.Top = _header.Height;
+        Height = _header.Height + (_expanded ? Body.Height : 0);
+    }
 }
