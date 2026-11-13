@@ -398,7 +398,7 @@ static volatile bool g_midgameSpectators = false;  // [multiplayer] allow_midgam
 // (SetLobbyType is unchanged); a genuinely full lobby still answers "Server is full." on join.
 static volatile bool g_keepLobbyJoinable = false;  // [multiplayer] keep_lobby_joinable
 static volatile bool g_portalCoop = true;          // [multiplayer] portal_coop (declared early; used in load_config)
-static volatile bool g_portalTwoWay = false;       // [multiplayer] portal_two_way (both ends interactable, teleport to the opposite end)
+static volatile bool g_portalTwoWay = true;        // [multiplayer] portal_two_way (both ends interactable, teleport to the opposite end); default on
 static void* g_specPathA1 = nullptr;   // overload1 assign-free-slot entry (g_base + 0x36b3dd)
 static void* g_specPathA2 = nullptr;   // overload2 assign-free-slot entry (g_base + 0x36bc52)
 static volatile long g_specLogged1 = 0, g_specLogged2 = 0;
@@ -911,7 +911,7 @@ static void load_config() {
     g_midgameSpectators = cfg_int("multiplayer", "allow_midgame_spectators", 0, g_iniPath) != 0;  // applied at startup (host)
     g_keepLobbyJoinable = cfg_int("multiplayer", "keep_lobby_joinable", 0, g_iniPath) != 0;       // applied at startup (host)
     g_portalCoop = cfg_int("multiplayer", "portal_coop", 1, g_iniPath) != 0;  // any player can use placed portals (both need the mod); live-toggleable
-    g_portalTwoWay = cfg_int("multiplayer", "portal_two_way", 0, g_iniPath) != 0;  // interact on either portal end to teleport to the other; live-toggleable
+    g_portalTwoWay = cfg_int("multiplayer", "portal_two_way", 1, g_iniPath) != 0;  // interact on either portal end to teleport to the other; live-toggleable
     g_wandSkillTree    = cfg_int("mage", "wand_skill_tree",    0, g_iniPath) != 0;  // live: sync_mage_patches re-applies it to the next mage built
     g_randomWandWeapon = cfg_int("mage", "random_wand_weapon", 0, g_iniPath) != 0;  // live: sync_mage_patches re-applies it to the next mage built
     g_wandZeroCharges  = cfg_int("mage", "wand_zero_charges",  0, g_iniPath) != 0;  // live: sync_mage_patches re-applies it to the next mage built

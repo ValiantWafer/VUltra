@@ -52,7 +52,6 @@ public class MainForm : Form
     NumericUpDown _randTreeCountNum = null!;      // Random class: how many skill trees to roll (0-16, stock 4)
     CheckBox _midgameSpecCheck = null!;          // Multiplayer: allow new joiners as spectators mid-game (startup)
     CheckBox _lobbyJoinableCheck = null!;        // Multiplayer: keep lobby advertised joinable mid-game (startup)
-    CheckBox _portalTwoWayCheck = null!;         // Multiplayer: interact either portal end to teleport to the other
     CheckBox _hostSyncCheck = null!;             // Multiplayer: host publishes settings to the lobby / client uses the host's
 
     static object[] LevelNames() => new object[] {
@@ -403,7 +402,8 @@ public class MainForm : Form
             body.Controls.Add(_randTreeCountNum);
         }
 
-        // ===== MULTIPLAYER ===== (HOST ONLY, except portal_two_way and host_settings_sync which both need)
+        // ===== MULTIPLAYER ===== (HOST ONLY, except host_settings_sync which both need). The portal fixes
+        // (portal_coop, portal_two_way) are always on and deliberately have no checkboxes.
         {
             var body = Section("MULTIPLAYER").Body;
             _midgameSpecCheck = new CheckBox {
@@ -418,15 +418,9 @@ public class MainForm : Form
             Tip(_lobbyJoinableCheck, IniDocs.Desc("keep_lobby_joinable"));
             body.Controls.Add(_lobbyJoinableCheck);
 
-            _portalTwoWayCheck = new CheckBox {
-                Text = IniDocs.Title("portal_two_way"), AutoSize = true, ForeColor = Fg,
-                Location = new Point(x0, 6 + rowH * 2), FlatStyle = FlatStyle.Flat };
-            Tip(_portalTwoWayCheck, IniDocs.Desc("portal_two_way"));
-            body.Controls.Add(_portalTwoWayCheck);
-
             _hostSyncCheck = new CheckBox {
                 Text = IniDocs.Title("host_settings_sync"), AutoSize = true, ForeColor = Fg,
-                Location = new Point(x0, 6 + rowH * 3), FlatStyle = FlatStyle.Flat };
+                Location = new Point(x0, 6 + rowH * 2), FlatStyle = FlatStyle.Flat };
             Tip(_hostSyncCheck, IniDocs.Desc("host_settings_sync"));
             body.Controls.Add(_hostSyncCheck);
         }
@@ -527,7 +521,6 @@ public class MainForm : Form
         _randTreeCountNum.Value = ClampNum(IniDocs.IntValue("random_tree_count", 4), _randTreeCountNum);
         _midgameSpecCheck.Checked = IniDocs.BoolValue("allow_midgame_spectators");
         _lobbyJoinableCheck.Checked = IniDocs.BoolValue("keep_lobby_joinable");
-        _portalTwoWayCheck.Checked = IniDocs.BoolValue("portal_two_way");
         _hostSyncCheck.Checked = IniDocs.BoolValue("host_settings_sync", true);
         _mageWandTreeCheck.Checked = IniDocs.BoolValue("wand_skill_tree");
         _mageRandomWandCheck.Checked = IniDocs.BoolValue("random_wand_weapon");
@@ -622,7 +615,6 @@ public class MainForm : Form
         _randTreeCountNum.Value = Math.Clamp(_inst.ReadRandomTreeCount(), (int)_randTreeCountNum.Minimum, (int)_randTreeCountNum.Maximum);
         _midgameSpecCheck.Checked = _inst.ReadAllowMidgameSpectators();
         _lobbyJoinableCheck.Checked = _inst.ReadKeepLobbyJoinable();
-        _portalTwoWayCheck.Checked = _inst.ReadPortalTwoWay();
         _hostSyncCheck.Checked = _inst.ReadHostSettingsSync();
         _debugCheck.Checked = _inst.ReadDebugWarp();
         _warpCombo.SelectedIndex = Math.Clamp(_inst.ReadWarpFloor(), 0, _warpCombo.Items.Count - 1);
@@ -650,7 +642,7 @@ public class MainForm : Form
     {
         if (_inst == null) return;
         if (ModInstaller.IsGameRunning) { SetStatus("Close Vagante first, then Install.", Warn); return; }
-        try { _inst.Install(PoolFromUi(), _wispCheck.Checked, _loopCheck.Checked, _forceWispCheck.Checked, _fairyCombo.SelectedIndex, _fairyStackCheck.Checked, (int)_fairyHealNum.Value, _debugCheck.Checked, _warpCombo.SelectedIndex, _loopStartCombo.SelectedIndex, (int)_startDiffNum.Value, _mageWandTreeCheck.Checked, _mageRandomWandCheck.Checked, _mageWandZeroCheck.Checked, (double)_harderByNum.Value, (int)_scalingStartsNum.Value, (int)_spawnPctNum.Value, (int)_spawnStartsNum.Value, (int)_spawnMaxNum.Value, (int)_spawnSpreadNum.Value, (int)_spawnSpreadStartsNum.Value, (int)_spawnSpreadMaxNum.Value, _cursedBombCheck.Checked, _randWeaponCheck.Checked, _randNoTreeCheck.Checked, _randArcheryCheck.Checked, _randHealthCheck.Checked, (int)_randTreeCountNum.Value, _midgameSpecCheck.Checked, _lobbyJoinableCheck.Checked, _portalTwoWayCheck.Checked, _hostSyncCheck.Checked); SetStatus("Installed. Launch Vagante - changes apply as new spellbooks generate.", Ok); MarkSaved(); }
+        try { _inst.Install(PoolFromUi(), _wispCheck.Checked, _loopCheck.Checked, _forceWispCheck.Checked, _fairyCombo.SelectedIndex, _fairyStackCheck.Checked, (int)_fairyHealNum.Value, _debugCheck.Checked, _warpCombo.SelectedIndex, _loopStartCombo.SelectedIndex, (int)_startDiffNum.Value, _mageWandTreeCheck.Checked, _mageRandomWandCheck.Checked, _mageWandZeroCheck.Checked, (double)_harderByNum.Value, (int)_scalingStartsNum.Value, (int)_spawnPctNum.Value, (int)_spawnStartsNum.Value, (int)_spawnMaxNum.Value, (int)_spawnSpreadNum.Value, (int)_spawnSpreadStartsNum.Value, (int)_spawnSpreadMaxNum.Value, _cursedBombCheck.Checked, _randWeaponCheck.Checked, _randNoTreeCheck.Checked, _randArcheryCheck.Checked, _randHealthCheck.Checked, (int)_randTreeCountNum.Value, _midgameSpecCheck.Checked, _lobbyJoinableCheck.Checked, _hostSyncCheck.Checked); SetStatus("Installed. Launch Vagante - changes apply as new spellbooks generate.", Ok); MarkSaved(); }
         catch (Exception ex) { SetStatus("Install failed: " + ex.Message, Warn); }
         RefreshButtons();
     }
@@ -660,7 +652,7 @@ public class MainForm : Form
         if (_inst == null) return;
         try
         {
-            _inst.WriteIni(PoolFromUi(), _wispCheck.Checked, _loopCheck.Checked, _forceWispCheck.Checked, _fairyCombo.SelectedIndex, _fairyStackCheck.Checked, (int)_fairyHealNum.Value, _debugCheck.Checked, _warpCombo.SelectedIndex, _loopStartCombo.SelectedIndex, (int)_startDiffNum.Value, _mageWandTreeCheck.Checked, _mageRandomWandCheck.Checked, _mageWandZeroCheck.Checked, (double)_harderByNum.Value, (int)_scalingStartsNum.Value, (int)_spawnPctNum.Value, (int)_spawnStartsNum.Value, (int)_spawnMaxNum.Value, (int)_spawnSpreadNum.Value, (int)_spawnSpreadStartsNum.Value, (int)_spawnSpreadMaxNum.Value, _cursedBombCheck.Checked, _randWeaponCheck.Checked, _randNoTreeCheck.Checked, _randArcheryCheck.Checked, _randHealthCheck.Checked, (int)_randTreeCountNum.Value, _midgameSpecCheck.Checked, _lobbyJoinableCheck.Checked, _portalTwoWayCheck.Checked, _hostSyncCheck.Checked);
+            _inst.WriteIni(PoolFromUi(), _wispCheck.Checked, _loopCheck.Checked, _forceWispCheck.Checked, _fairyCombo.SelectedIndex, _fairyStackCheck.Checked, (int)_fairyHealNum.Value, _debugCheck.Checked, _warpCombo.SelectedIndex, _loopStartCombo.SelectedIndex, (int)_startDiffNum.Value, _mageWandTreeCheck.Checked, _mageRandomWandCheck.Checked, _mageWandZeroCheck.Checked, (double)_harderByNum.Value, (int)_scalingStartsNum.Value, (int)_spawnPctNum.Value, (int)_spawnStartsNum.Value, (int)_spawnMaxNum.Value, (int)_spawnSpreadNum.Value, (int)_spawnSpreadStartsNum.Value, (int)_spawnSpreadMaxNum.Value, _cursedBombCheck.Checked, _randWeaponCheck.Checked, _randNoTreeCheck.Checked, _randArcheryCheck.Checked, _randHealthCheck.Checked, (int)_randTreeCountNum.Value, _midgameSpecCheck.Checked, _lobbyJoinableCheck.Checked, _hostSyncCheck.Checked);
             SetStatus(ModInstaller.IsGameRunning
                 ? "Saved. Already-running game picks it up on the next room/level."
                 : "Saved.", Ok);
@@ -741,7 +733,6 @@ public class MainForm : Form
           .Append('|').Append((int)_randTreeCountNum.Value)
           .Append('|').Append(_midgameSpecCheck.Checked ? 1 : 0)
           .Append('|').Append(_lobbyJoinableCheck.Checked ? 1 : 0)
-          .Append('|').Append(_portalTwoWayCheck.Checked ? 1 : 0)
           .Append('|').Append(_hostSyncCheck.Checked ? 1 : 0);
         return sb.ToString();
     }
