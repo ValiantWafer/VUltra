@@ -19,7 +19,6 @@ dll/openal32.exp
 dll/*.obj
 dll/*.exp
 dll/*.lib
-dll/loadtest.exe
 dll/build.log
 
 # --- python tooling cache ---
