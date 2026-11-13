@@ -13,6 +13,8 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <cctype>
 #include <cmath>
 #include <intrin.h>
 #include "exports.h"
@@ -796,74 +798,136 @@ static bool ini_mtime(FILETIME* out) {
     if (!GetFileAttributesExA(g_iniPath, GetFileExInfoStandard, &d)) return false;
     *out = d.ftLastWriteTime; return true;
 }
+// ---- Host settings sync: config overrides --------------------------------
+// In multiplayer the host publishes its settings in the Steam lobby (see "Host settings sync" below),
+// and a modded client with the same VULTRA_VERSION uses them in place of its own ini. The client's
+// ini file is never written. Every setting load_config reads goes through cfg_int / cfg_str:
+//   - while overrides are active (client in a modded host's lobby), a synced key returns the host's
+//     value; everything else still comes from the local ini.
+//   - every read is also recorded into g_cfgSnap (key -> effective value), which is exactly what a
+//     host publishes. So the synced-key list is "whatever load_config reads", minus g_cfgNoSync.
+//   Keys are unique across sections (the manager relies on that too), so overrides key on name only.
+static volatile DWORD g_lastServerStep = 0;   // updated every Server::step; recent => this instance is the MP host
+static const char* const VULTRA_VERSION = "1.5.0-dev";   // bump on any change to what syncs or how
+struct CfgKV { char key[40]; char val[24]; };
+static const int CFG_MAX = 128;
+static CfgKV g_cfgSnap[CFG_MAX]; static int g_cfgSnapN = 0;   // last load_config's effective values
+static CfgKV g_cfgOvr[CFG_MAX];  static int g_cfgOvrN = 0;    // host's values (client only)
+static volatile bool g_cfgOvrActive = false;
+static SRWLOCK g_cfgLock = SRWLOCK_INIT;                      // guards load_config + both tables
+static volatile bool g_hostSync = true;                       // [multiplayer] host_settings_sync
+// Never synced: debug hotkeys, host-only startup options, and the sync switch itself.
+static const char* const g_cfgNoSync[] = {
+    "test_warp", "warp_floor", "allow_midgame_spectators", "keep_lobby_joinable", "host_settings_sync",
+};
+static bool cfg_is_synced(const char* key) {
+    for (const char* k : g_cfgNoSync) if (_stricmp(k, key) == 0) return false;
+    return true;
+}
+static const char* cfg_ovr_find(const char* key) {
+    if (!g_cfgOvrActive || !cfg_is_synced(key)) return nullptr;
+    for (int i = 0; i < g_cfgOvrN; i++) if (_stricmp(g_cfgOvr[i].key, key) == 0) return g_cfgOvr[i].val;
+    return nullptr;
+}
+static void cfg_snap_put(const char* key, const char* val) {
+    if (!cfg_is_synced(key) || g_cfgSnapN >= CFG_MAX) return;
+    CfgKV& e = g_cfgSnap[g_cfgSnapN++];
+    strncpy_s(e.key, key, _TRUNCATE); strncpy_s(e.val, val, _TRUNCATE);
+}
+// Same argument order as GetPrivateProfileIntA / GetPrivateProfileStringA, so load_config reads alike.
+static UINT cfg_int(const char* sec, const char* key, int def, const char* path) {
+    const char* o = cfg_ovr_find(key);
+    int v = o ? atoi(o) : (int)GetPrivateProfileIntA(sec, key, def, path);
+    char b[16]; sprintf_s(b, "%d", v); cfg_snap_put(key, b);
+    return (UINT)v;
+}
+static void cfg_str(const char* sec, const char* key, const char* def, char* out, DWORD n, const char* path) {
+    const char* o = cfg_ovr_find(key);
+    if (o) strncpy_s(out, n, o, _TRUNCATE);
+    else   GetPrivateProfileStringA(sec, key, def, out, n, path);
+    cfg_snap_put(key, out);
+}
+
 static void load_config() {
+    g_cfgSnapN = 0;
     host_dir_file("vultramod.ini", g_iniPath);
     WritePrivateProfileStringA(nullptr, nullptr, nullptr, g_iniPath);  // flush Win ini cache -> read fresh
     for (int i = 0; i < N_SPELLS; i++)
-        g_enabled[i] = GetPrivateProfileIntA("spellbook_pool", g_spells[i].key, g_spells[i].def, g_iniPath) != 0;
-    g_wispCurse = GetPrivateProfileIntA("backgrounds", "wisp_curse", 0, g_iniPath) != 0;  // opt-in
-    g_replaceBg = (int)GetPrivateProfileIntA("backgrounds", "replace_bg", 5, g_iniPath);
-    g_forceWispCurse = GetPrivateProfileIntA("backgrounds", "force_wisp_curse", 0, g_iniPath) != 0;  // opt-in (host)
-    g_fairyMode = (int)GetPrivateProfileIntA("npc", "fairy_mode", 0, g_iniPath);             // 0=Default, 1=None, 2=All levels
-    g_fairyStack = GetPrivateProfileIntA("npc", "fairy_stack_blessing", 0, g_iniPath) != 0;  // +5 max HP per fairy (host)
-    g_fairyHeal = (int)GetPrivateProfileIntA("npc", "fairy_heal", 5, g_iniPath);              // max HP each fairy adds (host)
+        g_enabled[i] = cfg_int("spellbook_pool", g_spells[i].key, g_spells[i].def, g_iniPath) != 0;
+    g_wispCurse = cfg_int("backgrounds", "wisp_curse", 0, g_iniPath) != 0;  // opt-in
+    g_replaceBg = (int)cfg_int("backgrounds", "replace_bg", 5, g_iniPath);
+    g_forceWispCurse = cfg_int("backgrounds", "force_wisp_curse", 0, g_iniPath) != 0;  // opt-in (host)
+    g_fairyMode = (int)cfg_int("npc", "fairy_mode", 0, g_iniPath);             // 0=Default, 1=None, 2=All levels
+    g_fairyStack = cfg_int("npc", "fairy_stack_blessing", 0, g_iniPath) != 0;  // +5 max HP per fairy (host)
+    g_fairyHeal = (int)cfg_int("npc", "fairy_heal", 5, g_iniPath);              // max HP each fairy adds (host)
     if (g_fairyHeal < 0)    g_fairyHeal = 0;
     if (g_fairyHeal > 1000) g_fairyHeal = 1000;
     g_fairyHealDelta = g_fairyHeal - 5;
-    g_loop = GetPrivateProfileIntA("loop", "new_game_plus", 0, g_iniPath) != 0;            // opt-in
-    g_startDifficulty = (int)GetPrivateProfileIntA("loop", "start_difficulty", 2, g_iniPath);  // run starts at this tier (1..100)
+    g_loop = cfg_int("loop", "new_game_plus", 0, g_iniPath) != 0;            // opt-in
+    g_startDifficulty = (int)cfg_int("loop", "start_difficulty", 2, g_iniPath);  // run starts at this tier (1..100)
     if (g_startDifficulty < 1)   g_startDifficulty = 1;
     if (g_startDifficulty > 100) g_startDifficulty = 100;
-    g_loopTestWarp  = GetPrivateProfileIntA("loop", "test_warp", 0, g_iniPath) != 0;       // dev/test only (F11 warp)
-    g_loopStartFloor = (int)GetPrivateProfileIntA("loop", "loop_start_floor", 0, g_iniPath);  // where the loop restarts
-    g_warpFloor      = (int)GetPrivateProfileIntA("loop", "warp_floor", 0, g_iniPath);        // F11 destination
-    g_campfireOnWrap = GetPrivateProfileIntA("loop", "campfire_on_wrap", 0, g_iniPath) != 0;  // campfire before restart
-    g_loopFinalFloor = (int)GetPrivateProfileIntA("loop", "final_floor", 13, g_iniPath);
+    g_loopTestWarp  = cfg_int("loop", "test_warp", 0, g_iniPath) != 0;       // dev/test only (F11 warp)
+    g_loopStartFloor = (int)cfg_int("loop", "loop_start_floor", 0, g_iniPath);  // where the loop restarts
+    g_warpFloor      = (int)cfg_int("loop", "warp_floor", 0, g_iniPath);        // F11 destination
+    g_campfireOnWrap = cfg_int("loop", "campfire_on_wrap", 0, g_iniPath) != 0;  // campfire before restart
+    g_loopFinalFloor = (int)cfg_int("loop", "final_floor", 13, g_iniPath);
     {   // escalating loops: "harder by" is a float percent; read as a string and parse
         char buf[32];
-        GetPrivateProfileStringA("loop", "loop_scale_pct", "50", buf, sizeof(buf), g_iniPath);
+        cfg_str("loop", "loop_scale_pct", "50", buf, sizeof(buf), g_iniPath);
         g_harderByPct = (float)atof(buf);
         if (g_harderByPct < 0.0f)    g_harderByPct = 0.0f;
         if (g_harderByPct > 1000.0f) g_harderByPct = 1000.0f;
     }
-    g_scalingStartsAt = (int)GetPrivateProfileIntA("loop", "scaling_starts_at", 3, g_iniPath);  // tier the extra scaling begins
+    g_scalingStartsAt = (int)cfg_int("loop", "scaling_starts_at", 3, g_iniPath);  // tier the extra scaling begins
     if (g_scalingStartsAt < 1)   g_scalingStartsAt = 1;
     if (g_scalingStartsAt > 100) g_scalingStartsAt = 100;
-    g_spawnIncreasePct = (int)GetPrivateProfileIntA("loop", "spawn_increase_pct", 0, g_iniPath);   // +N% enemies/level/loop
+    g_spawnIncreasePct = (int)cfg_int("loop", "spawn_increase_pct", 0, g_iniPath);   // +N% enemies/level/loop
     if (g_spawnIncreasePct < 0)     g_spawnIncreasePct = 0;
     if (g_spawnIncreasePct > 10000) g_spawnIncreasePct = 10000;
-    g_spawnIncreaseStartsAt = (int)GetPrivateProfileIntA("loop", "spawn_increase_starts_at", 3, g_iniPath);
+    g_spawnIncreaseStartsAt = (int)cfg_int("loop", "spawn_increase_starts_at", 3, g_iniPath);
     if (g_spawnIncreaseStartsAt < 1)   g_spawnIncreaseStartsAt = 1;
     if (g_spawnIncreaseStartsAt > 100) g_spawnIncreaseStartsAt = 100;
-    g_spawnIncreaseMaxPct = (int)GetPrivateProfileIntA("loop", "spawn_increase_max_pct", 0, g_iniPath);  // 0 = no cap
+    g_spawnIncreaseMaxPct = (int)cfg_int("loop", "spawn_increase_max_pct", 0, g_iniPath);  // 0 = no cap
     if (g_spawnIncreaseMaxPct < 0)      g_spawnIncreaseMaxPct = 0;
     if (g_spawnIncreaseMaxPct > 100000) g_spawnIncreaseMaxPct = 100000;
-    g_spawnSpreadPct = (int)GetPrivateProfileIntA("loop", "spawn_spread_pct", 0, g_iniPath);  // spread-out density
+    g_spawnSpreadPct = (int)cfg_int("loop", "spawn_spread_pct", 0, g_iniPath);  // spread-out density
     if (g_spawnSpreadPct < 0)     g_spawnSpreadPct = 0;
     if (g_spawnSpreadPct > 10000) g_spawnSpreadPct = 10000;
-    g_spawnSpreadStartsAt = (int)GetPrivateProfileIntA("loop", "spawn_spread_starts_at", 3, g_iniPath);
+    g_spawnSpreadStartsAt = (int)cfg_int("loop", "spawn_spread_starts_at", 3, g_iniPath);
     if (g_spawnSpreadStartsAt < 1)   g_spawnSpreadStartsAt = 1;
     if (g_spawnSpreadStartsAt > 100) g_spawnSpreadStartsAt = 100;
-    g_spawnSpreadMaxPct = (int)GetPrivateProfileIntA("loop", "spawn_spread_max_pct", 0, g_iniPath);  // 0 = no cap
+    g_spawnSpreadMaxPct = (int)cfg_int("loop", "spawn_spread_max_pct", 0, g_iniPath);  // 0 = no cap
     if (g_spawnSpreadMaxPct < 0)      g_spawnSpreadMaxPct = 0;
     if (g_spawnSpreadMaxPct > 100000) g_spawnSpreadMaxPct = 100000;
-    g_cursedBomb = GetPrivateProfileIntA("player", "god_cursed_bomb", 0, g_iniPath) != 0;   // spawn loadout (host)
-    g_randWeaponMatch = GetPrivateProfileIntA("player", "random_match_weapon", 0, g_iniPath) != 0;  // live-toggleable
-    g_randNoTreeDefault = GetPrivateProfileIntA("player", "random_no_tree_default", 1, g_iniPath) != 0;  // 1=default weapon, 0=fists
-    g_randArcheryBow = GetPrivateProfileIntA("player", "random_archery_bow", 1, g_iniPath) != 0;  // Archery tree -> +bow +30 arrows
-    g_randHealth = GetPrivateProfileIntA("player", "random_health", 0, g_iniPath) != 0;  // random max HP 60..100 for Random chars
-    g_randomTreeCount = (int)GetPrivateProfileIntA("player", "random_tree_count", 4, g_iniPath);  // # skill trees a Random char rolls (stock 4)
+    g_cursedBomb = cfg_int("player", "god_cursed_bomb", 0, g_iniPath) != 0;   // spawn loadout (host)
+    g_randWeaponMatch = cfg_int("player", "random_match_weapon", 0, g_iniPath) != 0;  // live-toggleable
+    g_randNoTreeDefault = cfg_int("player", "random_no_tree_default", 1, g_iniPath) != 0;  // 1=default weapon, 0=fists
+    g_randArcheryBow = cfg_int("player", "random_archery_bow", 1, g_iniPath) != 0;  // Archery tree -> +bow +30 arrows
+    g_randHealth = cfg_int("player", "random_health", 0, g_iniPath) != 0;  // random max HP 60..100 for Random chars
+    g_randomTreeCount = (int)cfg_int("player", "random_tree_count", 4, g_iniPath);  // # skill trees a Random char rolls (stock 4)
     if (g_randomTreeCount < 0)  g_randomTreeCount = 0;
     if (g_randomTreeCount > 16) g_randomTreeCount = 16;   // candidate pool is 16 distinct affinity types
-    g_midgameSpectators = GetPrivateProfileIntA("multiplayer", "allow_midgame_spectators", 0, g_iniPath) != 0;  // applied at startup (host)
-    g_keepLobbyJoinable = GetPrivateProfileIntA("multiplayer", "keep_lobby_joinable", 0, g_iniPath) != 0;       // applied at startup (host)
-    g_portalCoop = GetPrivateProfileIntA("multiplayer", "portal_coop", 1, g_iniPath) != 0;  // any player can use placed portals (both need the mod); live-toggleable
-    g_portalTwoWay = GetPrivateProfileIntA("multiplayer", "portal_two_way", 0, g_iniPath) != 0;  // interact on either portal end to teleport to the other; live-toggleable
-    g_wandSkillTree    = GetPrivateProfileIntA("mage", "wand_skill_tree",    0, g_iniPath) != 0;  // applied at startup
-    g_randomWandWeapon = GetPrivateProfileIntA("mage", "random_wand_weapon", 0, g_iniPath) != 0;  // applied at startup
-    g_wandZeroCharges  = GetPrivateProfileIntA("mage", "wand_zero_charges",  0, g_iniPath) != 0;  // applied at startup
+    g_midgameSpectators = cfg_int("multiplayer", "allow_midgame_spectators", 0, g_iniPath) != 0;  // applied at startup (host)
+    g_keepLobbyJoinable = cfg_int("multiplayer", "keep_lobby_joinable", 0, g_iniPath) != 0;       // applied at startup (host)
+    g_portalCoop = cfg_int("multiplayer", "portal_coop", 1, g_iniPath) != 0;  // any player can use placed portals (both need the mod); live-toggleable
+    g_portalTwoWay = cfg_int("multiplayer", "portal_two_way", 0, g_iniPath) != 0;  // interact on either portal end to teleport to the other; live-toggleable
+    g_wandSkillTree    = cfg_int("mage", "wand_skill_tree",    0, g_iniPath) != 0;  // applied at startup
+    g_randomWandWeapon = cfg_int("mage", "random_wand_weapon", 0, g_iniPath) != 0;  // applied at startup
+    g_wandZeroCharges  = cfg_int("mage", "wand_zero_charges",  0, g_iniPath) != 0;  // applied at startup
+    g_hostSync = GetPrivateProfileIntA("multiplayer", "host_settings_sync", 1, g_iniPath) != 0;  // never synced (local choice)
     rebuild_pool();
     ini_mtime(&g_iniMtime);
+}
+// Re-read the config (ini + any host overrides) and re-apply everything that can change live.
+// Caller holds g_cfgLock exclusively.
+static void apply_config_now(const char* why) {
+    load_config();
+    apply_widening_if_needed();
+    sync_mage_patches();                 // re-apply/revert the mage Rod<->Wand options
+    apply_random_tree_count();           // re-apply the Random-character skill-tree count
+    logmsg("[vultra] config applied (%s); pool size %d, host overrides %s",
+           why, g_poolN, g_cfgOvrActive ? "ON" : "off");
 }
 // Live reload: if vultramod.ini changed on disk (e.g. the manager's "Save changes"),
 // re-read it so a running game picks up the new pool on the next spellbook it rolls.
@@ -871,11 +935,195 @@ static void reload_if_ini_changed() {
     FILETIME t;
     if (!ini_mtime(&t)) return;
     if (t.dwLowDateTime == g_iniMtime.dwLowDateTime && t.dwHighDateTime == g_iniMtime.dwHighDateTime) return;
-    load_config();
-    apply_widening_if_needed();
-    sync_mage_patches();                 // re-apply/revert the mage Rod<->Wand options to match the ini
-    apply_random_tree_count();           // re-apply the Random-character skill-tree count
-    logmsg("[vultra] config reloaded live; pool size %d", g_poolN);
+    AcquireSRWLockExclusive(&g_cfgLock);
+    apply_config_now("ini changed");
+    ReleaseSRWLockExclusive(&g_cfgLock);
+}
+
+// ---- Host settings sync: Steam lobby glue --------------------------------
+// Vagante runs multiplayer through a Steam lobby. The host stores two lobby-data keys:
+//   vultra_ver = VULTRA_VERSION      vultra_cfg = "key=value;key=value;..." (its effective settings)
+// and re-publishes whenever they change (e.g. the manager saves mid-lobby or mid-run). Each modded
+// client stores member-data vultra_ver, so the host can tell who has the mod and which version.
+// A modded client whose version matches applies vultra_cfg as overrides (see cfg_int), live, the
+// moment it changes. On a version mismatch, an unmodded host, or leaving the lobby, it drops the
+// overrides and goes back to its own ini. Unmodded players never read these keys, so they're unaffected.
+//   We call steam_api.dll's flat C API directly (the game's own copy). Lobby IDs come from the game:
+// Server+0xd10 (host; see Server::updateLobbyInformation) and Client+0x1f1a (client; unaligned, see
+// Client::onSteamLobbyJoined).
+static const size_t OFF_SERVER_LOBBY = 0xd10;    // Server: CSteamID of the hosted lobby (uint64)
+static const size_t OFF_CLIENT_LOBBY = 0x1f1a;   // Client: CSteamID of the joined lobby (uint64, unaligned)
+typedef void*       (__cdecl *SteamMM_t)();
+typedef bool        (__cdecl *SetLobbyData_t)(void*, uint64_t, const char*, const char*);
+typedef const char* (__cdecl *GetLobbyData_t)(void*, uint64_t, const char*);
+typedef void        (__cdecl *SetLobbyMemberData_t)(void*, uint64_t, const char*, const char*);
+typedef const char* (__cdecl *GetLobbyMemberData_t)(void*, uint64_t, uint64_t, const char*);
+typedef int         (__cdecl *GetNumLobbyMembers_t)(void*, uint64_t);
+typedef uint64_t    (__cdecl *GetLobbyMemberByIndex_t)(void*, uint64_t, int);
+typedef uint64_t    (__cdecl *GetLobbyOwner_t)(void*, uint64_t);
+static struct {
+    bool tried = false, ok = false;
+    SteamMM_t mm; SetLobbyData_t setData; GetLobbyData_t getData;
+    SetLobbyMemberData_t setMember; GetLobbyMemberData_t getMember;
+    GetNumLobbyMembers_t numMembers; GetLobbyMemberByIndex_t memberAt; GetLobbyOwner_t owner;
+} g_sl;
+static bool steam_lobby_api() {
+    if (g_sl.tried) return g_sl.ok;
+    g_sl.tried = true;
+    HMODULE h = GetModuleHandleA("steam_api.dll");
+    if (!h) { logmsg("[sync] steam_api.dll not loaded; host settings sync disabled"); return false; }
+    g_sl.mm         = (SteamMM_t)              GetProcAddress(h, "SteamAPI_SteamMatchmaking_v009");
+    g_sl.setData    = (SetLobbyData_t)         GetProcAddress(h, "SteamAPI_ISteamMatchmaking_SetLobbyData");
+    g_sl.getData    = (GetLobbyData_t)         GetProcAddress(h, "SteamAPI_ISteamMatchmaking_GetLobbyData");
+    g_sl.setMember  = (SetLobbyMemberData_t)   GetProcAddress(h, "SteamAPI_ISteamMatchmaking_SetLobbyMemberData");
+    g_sl.getMember  = (GetLobbyMemberData_t)   GetProcAddress(h, "SteamAPI_ISteamMatchmaking_GetLobbyMemberData");
+    g_sl.numMembers = (GetNumLobbyMembers_t)   GetProcAddress(h, "SteamAPI_ISteamMatchmaking_GetNumLobbyMembers");
+    g_sl.memberAt   = (GetLobbyMemberByIndex_t)GetProcAddress(h, "SteamAPI_ISteamMatchmaking_GetLobbyMemberByIndex");
+    g_sl.owner      = (GetLobbyOwner_t)        GetProcAddress(h, "SteamAPI_ISteamMatchmaking_GetLobbyOwner");
+    g_sl.ok = g_sl.mm && g_sl.setData && g_sl.getData && g_sl.setMember && g_sl.getMember &&
+              g_sl.numMembers && g_sl.memberAt && g_sl.owner;
+    logmsg("[sync] steam lobby api %s (version %s)", g_sl.ok ? "ready" : "MISSING EXPORTS", VULTRA_VERSION);
+    return g_sl.ok;
+}
+// A lobby we're actually in (Steam reports 0 members for lobbies we aren't a member of).
+static void* lobby_mm(uint64_t lobby) {
+    if (!lobby || !steam_lobby_api()) return nullptr;
+    void* m = g_sl.mm();
+    return (m && g_sl.numMembers(m, lobby) > 0) ? m : nullptr;
+}
+
+// Host: publish version + settings once a second if they changed; log members' mod versions.
+static void host_sync_tick(void* server) {
+    static DWORD last = 0;
+    DWORD now = GetTickCount();
+    if (!server || now - last < 1000) return;
+    last = now;
+    uint64_t lobby = *reinterpret_cast<uint64_t*>(reinterpret_cast<uint8_t*>(server) + OFF_SERVER_LOBBY);
+    void* m = lobby_mm(lobby);
+    if (!m) return;
+    static char lastCfg[4096] = {0};
+    static uint64_t lastLobby = 0;
+    char cfg[4096] = {0};
+    if (g_hostSync) {
+        size_t len = 0;
+        AcquireSRWLockShared(&g_cfgLock);
+        for (int i = 0; i < g_cfgSnapN; i++) {
+            int w = sprintf_s(cfg + len, sizeof(cfg) - len, "%s%s=%s", len ? ";" : "", g_cfgSnap[i].key, g_cfgSnap[i].val);
+            if (w < 0) break;
+            len += (size_t)w;
+        }
+        ReleaseSRWLockShared(&g_cfgLock);
+    }
+    if (lobby != lastLobby || strcmp(cfg, lastCfg) != 0) {
+        g_sl.setData(m, lobby, "vultra_ver", VULTRA_VERSION);
+        g_sl.setData(m, lobby, "vultra_cfg", cfg);   // "" = host has sync turned off
+        logmsg("[sync] host published %s settings (%u bytes) to lobby %llx",
+               cfg[0] ? "its" : "NO", (unsigned)strlen(cfg), lobby);
+        strcpy_s(lastCfg, cfg);
+        lastLobby = lobby;
+    }
+    // Every 5 s, report who has the mod (logged on change). The host itself is the owner: skipped.
+    static DWORD lastScan = 0;
+    if (now - lastScan < 5000) return;
+    lastScan = now;
+    static struct { uint64_t id; char ver[24]; } seen[8];
+    static int seenN = 0;
+    uint64_t owner = g_sl.owner(m, lobby);
+    int n = g_sl.numMembers(m, lobby);
+    for (int i = 0; i < n && i < 8; i++) {
+        uint64_t id = g_sl.memberAt(m, lobby, i);
+        if (!id || id == owner) continue;
+        const char* v = g_sl.getMember(m, lobby, id, "vultra_ver");
+        char ver[24]; strncpy_s(ver, (v && *v) ? v : "none", _TRUNCATE);
+        int k = 0;
+        while (k < seenN && seen[k].id != id) k++;
+        if (k < seenN && strcmp(seen[k].ver, ver) == 0) continue;
+        if (k == seenN) { if (seenN >= 8) continue; seen[seenN].id = id; seenN++; }
+        strcpy_s(seen[k].ver, ver);
+        if (strcmp(ver, VULTRA_VERSION) == 0) logmsg("[sync] member %llx has VUltra %s (in sync)", id, ver);
+        else if (strcmp(ver, "none") == 0)    logmsg("[sync] member %llx does NOT have VUltra", id);
+        else logmsg("[sync] member %llx has VUltra %s, host has %s (NOT synced)", id, ver, VULTRA_VERSION);
+    }
+}
+
+// Client: drop the host's overrides and go back to the local ini.
+static void client_clear_overrides(const char* why) {
+    if (!g_cfgOvrActive) return;
+    AcquireSRWLockExclusive(&g_cfgLock);
+    g_cfgOvrActive = false;
+    g_cfgOvrN = 0;
+    apply_config_now(why);
+    ReleaseSRWLockExclusive(&g_cfgLock);
+}
+// Parse "k=v;k=v" strictly: a key must be one this build reads (it's in our own snapshot) and a
+// value must be a plain number. Anything else is skipped. load_config clamps the ranges afterwards.
+static int parse_host_cfg(const char* s, CfgKV* out, int max) {
+    int n = 0;
+    while (*s && n < max) {
+        const char* end = strchr(s, ';');
+        size_t len = end ? (size_t)(end - s) : strlen(s);
+        const char* eq = (const char*)memchr(s, '=', len);
+        if (eq) {
+            size_t kl = (size_t)(eq - s), vl = len - kl - 1;
+            bool ok = kl > 0 && kl < sizeof(out[0].key) && vl > 0 && vl < sizeof(out[0].val);
+            for (size_t i = 0; ok && i < kl; i++) ok = isalnum((unsigned char)s[i]) || s[i] == '_';
+            for (size_t i = 0; ok && i < vl; i++) ok = isdigit((unsigned char)eq[1 + i]) || strchr("-+.", eq[1 + i]);
+            if (ok) {
+                memcpy(out[n].key, s, kl); out[n].key[kl] = 0;
+                memcpy(out[n].val, eq + 1, vl); out[n].val[vl] = 0;
+                bool known = false;
+                for (int i = 0; i < g_cfgSnapN && !known; i++) known = _stricmp(g_cfgSnap[i].key, out[n].key) == 0;
+                if (known && cfg_is_synced(out[n].key)) n++;
+            }
+        }
+        if (!end) break;
+        s = end + 1;
+    }
+    return n;
+}
+// Client: once a second, read the host's lobby data and apply it if it changed.
+static void client_sync_tick(void* client) {
+    static DWORD last = 0;
+    DWORD now = GetTickCount();
+    if (now - last < 1000) return;
+    last = now;
+    if (now - g_lastServerStep < 2000) { client_clear_overrides("hosting"); return; }   // we ARE the host
+    uint64_t lobby = 0;
+    if (client) memcpy(&lobby, reinterpret_cast<uint8_t*>(client) + OFF_CLIENT_LOBBY, sizeof(lobby));
+    void* m = lobby_mm(lobby);
+    if (!m || !g_hostSync) { client_clear_overrides(m ? "sync turned off" : "left lobby"); return; }
+    static uint64_t announced = 0;
+    if (lobby != announced) {
+        g_sl.setMember(m, lobby, "vultra_ver", VULTRA_VERSION);
+        announced = lobby;
+        logmsg("[sync] joined lobby %llx; announced VUltra %s", lobby, VULTRA_VERSION);
+    }
+    const char* ver = g_sl.getData(m, lobby, "vultra_ver");
+    const char* cfg = g_sl.getData(m, lobby, "vultra_cfg");
+    static char lastNote[64] = {0};
+    char note[64];
+    if (!ver || !*ver)                       strcpy_s(note, "host has no VUltra");
+    else if (strcmp(ver, VULTRA_VERSION))    sprintf_s(note, "host has VUltra %.20s, we have %s", ver, VULTRA_VERSION);
+    else if (!cfg || !*cfg)                  strcpy_s(note, "host turned sync off");
+    else                                     note[0] = 0;
+    if (note[0]) {
+        if (strcmp(note, lastNote)) { logmsg("[sync] not syncing: %s", note); strcpy_s(lastNote, note); }
+        client_clear_overrides(note);
+        return;
+    }
+    lastNote[0] = 0;
+    static char lastCfg[4096] = {0};
+    if (g_cfgOvrActive && strcmp(cfg, lastCfg) == 0) return;   // nothing new
+    static CfgKV parsed[CFG_MAX];
+    AcquireSRWLockExclusive(&g_cfgLock);
+    int n = parse_host_cfg(cfg, parsed, CFG_MAX);
+    memcpy(g_cfgOvr, parsed, sizeof(CfgKV) * n);
+    g_cfgOvrN = n;
+    g_cfgOvrActive = true;
+    apply_config_now("host settings");
+    ReleaseSRWLockExclusive(&g_cfgLock);
+    strncpy_s(lastCfg, cfg, _TRUNCATE);
+    logmsg("[sync] applied %d host settings from lobby %llx", n, lobby);
 }
 
 static void save_config() {
@@ -1211,7 +1459,7 @@ __declspec(naked) static void det_bonfireHeal() {
 // enterPortal makes its own ref-counted copies of the link while it runs. With the link present the
 // unmodified enterPortal teleports whoever entered, on host and client alike. Both players need the
 // mod (the teleport runs authoritatively on the host AND is predicted on the entering client).
-static volatile DWORD g_lastServerStep = 0;   // updated every Server::step; recent => this instance is the MP host
+// g_lastServerStep is defined earlier (host settings sync reads it too).
 static const uintptr_t RVA_ENTER_PORTAL    = 0x003a48a0;  // SpellEntity::enterPortal(shared_ptr<Entity>)
 static const uintptr_t RVA_SPELLENTITY_VFT = 0x0071ef58;  // ??_7SpellEntity@@6B@ (identifies a SpellEntity)
 static const size_t OFF_ENT_OWNER        = 0x218;   // SpellEntity owner shared_ptr (raw ptr; ctrl at +0x21c)
@@ -1717,6 +1965,7 @@ static clientStep_t g_stepTramp = nullptr;
 static void flush_enemy_dups(void* ge);   // defined below (enemy-duplication section)
 static void __cdecl step_frame(void* client) {
     reload_if_ini_changed();   // pick up manager "Save" live (e.g. in the lobby) -> re-syncs mage options
+    client_sync_tick(client);  // MP client: apply the host's lobby-published settings (live)
     if (client) g_ge = reinterpret_cast<uint8_t*>(client) + OFF_CLIENT_GE;
     flush_enemy_dups(g_ge);    // spawn any queued enemy copies into the live level (deferred, safe here)
     // Difficulty model (self-driven; NO newGame hook — that crashed). Loop number = g_loopCount + 1:
@@ -1850,6 +2099,7 @@ typedef void (__fastcall *serverStep_t)(void* self, void* edx);
 static serverStep_t g_serverStepTramp = nullptr;
 static void __cdecl server_step_frame(void* server) {
     g_lastServerStep = GetTickCount();            // tell the client thread a server is active (= MP host)
+    host_sync_tick(server);                       // MP host: publish settings to the lobby (on change)
     // MP escalating-loop reset on the authoritative server GE: a fresh host run clears newGamePlus,
     // a looped run keeps it set (server_loop_now arms it). Keeps the cycle count correct on the host.
     if (server && *(reinterpret_cast<uint8_t*>(server) + OFF_SERVER_GE + OFF_GE_NEWGAMEPLUS) == 0)
