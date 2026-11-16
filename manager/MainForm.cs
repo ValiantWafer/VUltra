@@ -32,6 +32,13 @@ public class MainForm : Form
     CheckBox _mageWandTreeCheck = null!;   // mage: Wand skill tree instead of Rod
     CheckBox _mageRandomWandCheck = null!; // mage: random Wand weapon instead of Rod
     CheckBox _mageWandZeroCheck = null!;   // mage: starting wand begins at 0 charges
+    CheckBox _startPointsCheck = null!, _startRegensCheck = null!, _startBooksCheck = null!;  // Debug: start kit
+    // Debug: start with one of each weapon in a category (ini key start_weapons_<category>).
+    static readonly (string Cat, string Label)[] WeaponKitCats = {
+        ("daggers", "Daggers"), ("swords", "Swords"), ("clubs", "Clubs && hammers"),
+        ("axes", "Axes"), ("fists", "Fist weapons"), ("bows", "Bows + arrows"),
+        ("wands", "Wands"), ("rods", "Rods"), ("special", "Special") };
+    readonly Dictionary<string, CheckBox> _weaponKitChecks = new();
     CheckBox _debugCheck = null!;       // dev tools: enables F11 warp + reveals the target dropdown
     Label _warpLabel = null!;
     ComboBox _warpCombo = null!;        // F11 warp target floor (0..12)
@@ -49,8 +56,8 @@ public class MainForm : Form
     CheckBox _randNoTreeCheck = null!;           // Random class with no weapon tree: default weapon (off = fists)
     CheckBox _randArcheryCheck = null!;          // Random class with Archery tree: also get a bow + 30 arrows
     CheckBox _randHealthCheck = null!;           // Random class: randomized max HP (60-100)
+    CheckBox _randWoodsmanCheck = null!;         // Random class: Woodsman trees can be rolled
     NumericUpDown _randTreeCountNum = null!;      // Random class: how many skill trees to roll (0-16, stock 4)
-    CheckBox _houndAxeCheck = null!;             // Houndmaster starts with the brown axe + Axe tree (axe class preview)
     CheckBox _midgameSpecCheck = null!;          // Multiplayer: allow new joiners as spectators mid-game (startup)
     CheckBox _lobbyJoinableCheck = null!;        // Multiplayer: keep lobby advertised joinable mid-game (startup)
     CheckBox _hostSyncCheck = null!;             // Multiplayer: host publishes settings to the lobby / client uses the host's
@@ -444,7 +451,14 @@ public class MainForm : Form
             Tip(_randHealthCheck, IniDocs.Desc("random_health"));
             body.Controls.Add(_randHealthCheck);
 
-            int randTreeY = randHealthY + rowH;
+            int randWoodsY = randHealthY + rowH;
+            _randWoodsmanCheck = new CheckBox {
+                Text = IniDocs.Title("random_woodsman_trees"), AutoSize = true, ForeColor = Fg,
+                Location = new Point(x0, randWoodsY), FlatStyle = FlatStyle.Flat };
+            Tip(_randWoodsmanCheck, IniDocs.Desc("random_woodsman_trees"));
+            body.Controls.Add(_randWoodsmanCheck);
+
+            int randTreeY = randWoodsY + rowH;
             string randTreeTip = IniDocs.Desc("random_tree_count");
             var randTreeLbl = new Label { Text = IniDocs.Title("random_tree_count"), AutoSize = true, ForeColor = Fg,
                 Location = new Point(x0, randTreeY + 4) };
@@ -456,13 +470,6 @@ public class MainForm : Form
                 Location = new Point(After(randTreeLbl), randTreeY) };
             Tip(_randTreeCountNum, randTreeTip);
             body.Controls.Add(_randTreeCountNum);
-
-            int houndAxeY = randTreeY + rowH;
-            _houndAxeCheck = new CheckBox {
-                Text = IniDocs.Title("houndmaster_axe"), AutoSize = true, ForeColor = Fg,
-                Location = new Point(x0, houndAxeY), FlatStyle = FlatStyle.Flat };
-            Tip(_houndAxeCheck, IniDocs.Desc("houndmaster_axe"));
-            body.Controls.Add(_houndAxeCheck);
         }
 
         // ===== MULTIPLAYER ===== (HOST ONLY, except host_settings_sync which both need). The portal fixes
@@ -527,6 +534,34 @@ public class MainForm : Form
             body.Controls.Add(_warpCombo);
 
             _debugCheck.CheckedChanged += (_, _) => { _warpLabel.Visible = _debugCheck.Checked; _warpCombo.Visible = _debugCheck.Checked; };
+
+            // Start kit for testing: applies to each new character. Labels are set here (the ini key
+            // start_skill_points is a number; the checkbox writes 20 or 0).
+            int ky = warpY + rowH + 4;
+            CheckBox Kit(string text, string key) {
+                var cb = new CheckBox { Text = text, AutoSize = true, ForeColor = Warn,
+                    Location = new Point(x0, ky), FlatStyle = FlatStyle.Flat };
+                Tip(cb, IniDocs.Desc(key));
+                body.Controls.Add(cb);
+                ky += rowH;
+                return cb;
+            }
+            _startPointsCheck  = Kit("Start with 20 skill points", "start_skill_points");
+            _startRegensCheck  = Kit("Start with 999 regens", "start_regens");
+            _startBooksCheck   = Kit("Start with 1 of each spellbook", "start_all_spellbooks");
+            var kitLbl = new Label { Text = "Start with 1 of each:", AutoSize = true, ForeColor = Warn,
+                Location = new Point(x0, ky + 4) };
+            body.Controls.Add(kitLbl);
+            ky += rowH;
+            for (int i = 0; i < WeaponKitCats.Length; i++)     // 2 columns
+            {
+                var (cat, label) = WeaponKitCats[i];
+                var cb = new CheckBox { Text = label, AutoSize = true, ForeColor = Fg, FlatStyle = FlatStyle.Flat,
+                    Location = new Point(subX + (i % 2) * 190, ky + (i / 2) * rowH) };
+                Tip(cb, IniDocs.Desc("start_weapons_" + cat));
+                body.Controls.Add(cb);
+                _weaponKitChecks[cat] = cb;
+            }
         }
 
         root.Controls.Add(flow, 0, 1);
@@ -581,14 +616,18 @@ public class MainForm : Form
         _randArcheryCheck.Checked = IniDocs.BoolValue("random_archery_bow");
         _mageWandZeroCheck.Checked = IniDocs.BoolValue("wand_zero_charges");
         _randHealthCheck.Checked = IniDocs.BoolValue("random_health");
+        _randWoodsmanCheck.Checked = IniDocs.BoolValue("random_woodsman_trees");
         _randTreeCountNum.Value = ClampNum(IniDocs.IntValue("random_tree_count", 4), _randTreeCountNum);
-        _houndAxeCheck.Checked = IniDocs.BoolValue("houndmaster_axe");
         _midgameSpecCheck.Checked = IniDocs.BoolValue("allow_midgame_spectators");
         _lobbyJoinableCheck.Checked = IniDocs.BoolValue("keep_lobby_joinable");
         _hostSyncCheck.Checked = IniDocs.BoolValue("host_settings_sync", true);
         _mageWandTreeCheck.Checked = IniDocs.BoolValue("wand_skill_tree");
         _mageRandomWandCheck.Checked = IniDocs.BoolValue("random_wand_weapon");
         _debugCheck.Checked = IniDocs.BoolValue("test_warp");
+        _startPointsCheck.Checked = IniDocs.IntValue("start_skill_points") > 0;
+        _startRegensCheck.Checked = IniDocs.BoolValue("start_regens");
+        _startBooksCheck.Checked = IniDocs.BoolValue("start_all_spellbooks");
+        foreach (var (cat, cb) in _weaponKitChecks) cb.Checked = IniDocs.BoolValue("start_weapons_" + cat);
         _warpCombo.SelectedIndex = Math.Clamp(IniDocs.IntValue("warp_floor", 0), 0, _warpCombo.Items.Count - 1);
         _warpLabel.Visible = _warpCombo.Visible = _debugCheck.Checked;
         _loading = false;
@@ -676,12 +715,16 @@ public class MainForm : Form
         _randNoTreeCheck.Checked = _inst.ReadRandomNoTreeDefault();
         _randArcheryCheck.Checked = _inst.ReadRandomArcheryBow();
         _randHealthCheck.Checked = _inst.ReadRandomHealth();
+        _randWoodsmanCheck.Checked = _inst.ReadRandomWoodsmanTrees();
         _randTreeCountNum.Value = Math.Clamp(_inst.ReadRandomTreeCount(), (int)_randTreeCountNum.Minimum, (int)_randTreeCountNum.Maximum);
-        _houndAxeCheck.Checked = _inst.ReadHoundmasterAxe();
         _midgameSpecCheck.Checked = _inst.ReadAllowMidgameSpectators();
         _lobbyJoinableCheck.Checked = _inst.ReadKeepLobbyJoinable();
         _hostSyncCheck.Checked = _inst.ReadHostSettingsSync();
         _debugCheck.Checked = _inst.ReadDebugWarp();
+        _startPointsCheck.Checked = _inst.ReadStartSkillPoints();
+        _startRegensCheck.Checked = _inst.ReadStartRegens();
+        _startBooksCheck.Checked = _inst.ReadStartAllSpellbooks();
+        foreach (var (cat, cb) in _weaponKitChecks) cb.Checked = _inst.ReadStartWeapons(cat);
         _warpCombo.SelectedIndex = Math.Clamp(_inst.ReadWarpFloor(), 0, _warpCombo.Items.Count - 1);
         _warpLabel.Visible = _warpCombo.Visible = _debugCheck.Checked;
         RefreshButtons();
@@ -707,7 +750,7 @@ public class MainForm : Form
     {
         if (_inst == null) return;
         if (ModInstaller.IsGameRunning) { SetStatus("Close Vagante first, then Install.", Warn); return; }
-        try { _inst.Install(PoolFromUi(), _wispCheck.Checked, _loopCheck.Checked, _forceWispCheck.Checked, _fairyCombo.SelectedIndex, _fairyStackCheck.Checked, (int)_fairyHealNum.Value, _debugCheck.Checked, _warpCombo.SelectedIndex, _loopStartCombo.SelectedIndex, (int)_startDiffNum.Value, _mageWandTreeCheck.Checked, _mageRandomWandCheck.Checked, _mageWandZeroCheck.Checked, (double)_harderByNum.Value, (int)_scalingStartsNum.Value, (int)_spawnPctNum.Value, (int)_spawnStartsNum.Value, (int)_spawnMaxNum.Value, (int)_spawnSpreadNum.Value, (int)_spawnSpreadStartsNum.Value, (int)_spawnSpreadMaxNum.Value, _cursedBombCheck.Checked, _randWeaponCheck.Checked, _randNoTreeCheck.Checked, _randArcheryCheck.Checked, _randHealthCheck.Checked, (int)_randTreeCountNum.Value, _houndAxeCheck.Checked, _midgameSpecCheck.Checked, _lobbyJoinableCheck.Checked, _hostSyncCheck.Checked); SetStatus("Installed. Launch Vagante - changes apply as new spellbooks generate.", Ok); MarkSaved(); }
+        try { _inst.Install(PoolFromUi(), _wispCheck.Checked, _loopCheck.Checked, _forceWispCheck.Checked, _fairyCombo.SelectedIndex, _fairyStackCheck.Checked, (int)_fairyHealNum.Value, _debugCheck.Checked, _warpCombo.SelectedIndex, _loopStartCombo.SelectedIndex, (int)_startDiffNum.Value, _mageWandTreeCheck.Checked, _mageRandomWandCheck.Checked, _mageWandZeroCheck.Checked, (double)_harderByNum.Value, (int)_scalingStartsNum.Value, (int)_spawnPctNum.Value, (int)_spawnStartsNum.Value, (int)_spawnMaxNum.Value, (int)_spawnSpreadNum.Value, (int)_spawnSpreadStartsNum.Value, (int)_spawnSpreadMaxNum.Value, _cursedBombCheck.Checked, _randWeaponCheck.Checked, _randNoTreeCheck.Checked, _randArcheryCheck.Checked, _randHealthCheck.Checked, _randWoodsmanCheck.Checked, (int)_randTreeCountNum.Value, _midgameSpecCheck.Checked, _lobbyJoinableCheck.Checked, _hostSyncCheck.Checked, DebugKitValues()); SetStatus("Installed. Launch Vagante - changes apply as new spellbooks generate.", Ok); MarkSaved(); }
         catch (Exception ex) { SetStatus("Install failed: " + ex.Message, Warn); }
         RefreshButtons();
     }
@@ -717,7 +760,7 @@ public class MainForm : Form
         if (_inst == null) return;
         try
         {
-            _inst.WriteIni(PoolFromUi(), _wispCheck.Checked, _loopCheck.Checked, _forceWispCheck.Checked, _fairyCombo.SelectedIndex, _fairyStackCheck.Checked, (int)_fairyHealNum.Value, _debugCheck.Checked, _warpCombo.SelectedIndex, _loopStartCombo.SelectedIndex, (int)_startDiffNum.Value, _mageWandTreeCheck.Checked, _mageRandomWandCheck.Checked, _mageWandZeroCheck.Checked, (double)_harderByNum.Value, (int)_scalingStartsNum.Value, (int)_spawnPctNum.Value, (int)_spawnStartsNum.Value, (int)_spawnMaxNum.Value, (int)_spawnSpreadNum.Value, (int)_spawnSpreadStartsNum.Value, (int)_spawnSpreadMaxNum.Value, _cursedBombCheck.Checked, _randWeaponCheck.Checked, _randNoTreeCheck.Checked, _randArcheryCheck.Checked, _randHealthCheck.Checked, (int)_randTreeCountNum.Value, _houndAxeCheck.Checked, _midgameSpecCheck.Checked, _lobbyJoinableCheck.Checked, _hostSyncCheck.Checked);
+            _inst.WriteIni(PoolFromUi(), _wispCheck.Checked, _loopCheck.Checked, _forceWispCheck.Checked, _fairyCombo.SelectedIndex, _fairyStackCheck.Checked, (int)_fairyHealNum.Value, _debugCheck.Checked, _warpCombo.SelectedIndex, _loopStartCombo.SelectedIndex, (int)_startDiffNum.Value, _mageWandTreeCheck.Checked, _mageRandomWandCheck.Checked, _mageWandZeroCheck.Checked, (double)_harderByNum.Value, (int)_scalingStartsNum.Value, (int)_spawnPctNum.Value, (int)_spawnStartsNum.Value, (int)_spawnMaxNum.Value, (int)_spawnSpreadNum.Value, (int)_spawnSpreadStartsNum.Value, (int)_spawnSpreadMaxNum.Value, _cursedBombCheck.Checked, _randWeaponCheck.Checked, _randNoTreeCheck.Checked, _randArcheryCheck.Checked, _randHealthCheck.Checked, _randWoodsmanCheck.Checked, (int)_randTreeCountNum.Value, _midgameSpecCheck.Checked, _lobbyJoinableCheck.Checked, _hostSyncCheck.Checked, DebugKitValues());
             SetStatus(ModInstaller.IsGameRunning
                 ? "Saved. Already-running game picks it up on the next room/level."
                 : "Saved.", Ok);
@@ -795,12 +838,26 @@ public class MainForm : Form
           .Append('|').Append(_randNoTreeCheck.Checked ? 1 : 0)
           .Append('|').Append(_randArcheryCheck.Checked ? 1 : 0)
           .Append('|').Append(_randHealthCheck.Checked ? 1 : 0)
+          .Append('|').Append(_randWoodsmanCheck.Checked ? 1 : 0)
           .Append('|').Append((int)_randTreeCountNum.Value)
-          .Append('|').Append(_houndAxeCheck.Checked ? 1 : 0)
           .Append('|').Append(_midgameSpecCheck.Checked ? 1 : 0)
           .Append('|').Append(_lobbyJoinableCheck.Checked ? 1 : 0)
           .Append('|').Append(_hostSyncCheck.Checked ? 1 : 0);
+        foreach (var kv in DebugKitValues()) sb.Append('|').Append(kv.Value);
         return sb.ToString();
+    }
+
+    // Debug start kit, written to [player] alongside the rest.
+    Dictionary<string, string> DebugKitValues()
+    {
+        var d = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        {
+            ["start_skill_points"]   = _startPointsCheck.Checked ? "20" : "0",
+            ["start_regens"]         = _startRegensCheck.Checked ? "1" : "0",
+            ["start_all_spellbooks"] = _startBooksCheck.Checked ? "1" : "0",
+        };
+        foreach (var (cat, cb) in _weaponKitChecks) d["start_weapons_" + cat] = cb.Checked ? "1" : "0";
+        return d;
     }
 
     // Records the current UI as the "saved" baseline (called after a load or a successful write).
