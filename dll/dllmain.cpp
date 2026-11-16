@@ -881,7 +881,7 @@ static bool ini_mtime(FILETIME* out) {
 //   Keys are unique across sections (the manager relies on that too), so overrides key on name only.
 static volatile DWORD g_lastServerStep = 0;   // updated every Server::step; recent => this instance is the MP host
 static void* volatile g_lastServer = nullptr;  // the Server that ran that step (its GameEngine is the authoritative one)
-static const char* const VULTRA_VERSION = "1.5.1";   // bump on any change to what syncs or how
+static const char* const VULTRA_VERSION = "1.5.2";   // bump on any change to what syncs or how
 struct CfgKV { char key[40]; char val[24]; };
 static const int CFG_MAX = 128;
 static CfgKV g_cfgSnap[CFG_MAX]; static int g_cfgSnapN = 0;   // last load_config's effective values
@@ -2179,6 +2179,7 @@ static clientStep_t g_stepTramp = nullptr;
 static void flush_enemy_dups(void* ge);   // defined below (enemy-duplication section)
 static void sunder_tick();                // Brutalist tree (below)
 static void woodsman_tick();
+static void woodsman_server_tick(void* server);
 static void test_frame(void* client);     // testharness.h: runs one step of a test script (inert without one)
 static void __cdecl step_frame(void* client) {
     reload_if_ini_changed();   // pick up manager "Save" live (e.g. in the lobby) -> re-syncs mage options
@@ -2319,6 +2320,7 @@ static serverStep_t g_serverStepTramp = nullptr;
 static void __cdecl server_step_frame(void* server) {
     g_lastServerStep = GetTickCount();            // tell the client thread a server is active (= MP host)
     g_lastServer = server;
+    woodsman_server_tick(server);                 // the server's Party shadows, Momentum, Sunder (this thread)
     // MP escalating-loop reset on the authoritative server GE: a fresh host run clears newGamePlus,
     // a looped run keeps it set (server_loop_now arms it). Keeps the cycle count correct on the host.
     if (server && *(reinterpret_cast<uint8_t*>(server) + OFF_SERVER_GE + OFF_GE_NEWGAMEPLUS) == 0)
@@ -2512,9 +2514,12 @@ static int g_dupHead = 0, g_dupTail = 0;                     // single-threaded 
 // heal) at half strength, like the shadow's own weapon hits. Held by a weak reference, so a freed entity
 // whose address comes back is never mistaken for one (an entry whose object is gone is dropped).
 struct ShadowEnt { void* ptr; void* ctrl; };
-static ShadowEnt g_shadowEnts[64];
-static int g_shadowEntNext = 0;
-static int g_shadowActing = 0;
+// Per thread: on an MP host the server's game runs on its own thread, and its shadows are run there (from
+// server_step_frame), so each game's shadow state is its own. Stepping the server's shadow weapons from
+// the client thread added entities and projectiles to the server's level while the server walked it.
+static thread_local ShadowEnt g_shadowEnts[64];
+static thread_local int g_shadowEntNext = 0;
+static thread_local int g_shadowActing = 0;
 static void weak_release(void* ctrl) {
     if (!ctrl) return;
     if (InterlockedDecrement(reinterpret_cast<long*>(static_cast<uint8_t*>(ctrl) + 8)) == 0) {
@@ -4136,9 +4141,15 @@ struct CloneSwing { uint8_t* player; void* sp[2]; int due; int a, b, c; float f;
     // swing that happened on, replayed on the copy. smallBomb: the bomb you wound up was a small one.
     int stopAt; bool stopped, smallBomb; uint8_t prevCharge;
     // Holy light (Divine Weapon): the frame of your swing it came out on and your weapon speed then.
-    int holyAt; bool holyDone; float holySpeed; };
-static CloneSwing g_clones[16];
-static int g_cloneFrame = 0;
+    int holyAt; bool holyDone; float holySpeed;
+    // The level you swung on, and the level load count then. A level change (stairs, the campfire) drops the
+    // swing: its copy belongs to the old level, and 40 frames of replay carried it into the new one at your old
+    // spot, still pointing into the freed old level (2026-11-16: a client crashed entering the campfire, and
+    // the host's heap was corrupted). The count also catches a new level made at the old one's address.
+    void* level; long epoch; };
+static thread_local CloneSwing g_clones[16];
+static volatile long g_levelEpoch = 0;   // GameEngine::loadNextLevel calls, in either game
+static thread_local int g_cloneFrame = 0;
 static int g_shadowThrows = 0;   // shadow throws seen in this game (the test harness reads it)
 static uintptr_t g_startSwingVA = 0;
 __declspec(naked) static void call_start_swing(void* w, int a, int b, int c, float f) {
@@ -4171,7 +4182,7 @@ static bool clone_spot(const uint8_t* p, float* pos, uint8_t* flip) {
 // from (index 0 of afterImageFrames; a new level clears them). Sprite positions can't be used for this: a
 // flipped sprite's position is shifted by its width, so turning around moved the shadow's spot.
 struct CloneTrail { const uint8_t* p; float pos[64][2]; int head, n; };
-static CloneTrail g_trails[8];
+static thread_local CloneTrail g_trails[8];
 static void clone_trail_push(const uint8_t* p) {
     CloneTrail* t = nullptr;
     for (auto& tr : g_trails) if (tr.p == p) { t = &tr; break; }
@@ -4205,7 +4216,7 @@ static CloneSwing* clone_of(const uint8_t* w) {
 // the length of that call your position is swapped for the shadow's: its swings come off its body and its
 // thrown axe flies back to it.
 struct CloneOriginSwap { uint8_t* p; float x, y; };
-static CloneOriginSwap g_cloneSwapNow = { nullptr, 0, 0 };   // the swap in effect (for the catch log)
+static thread_local CloneOriginSwap g_cloneSwapNow = { nullptr, 0, 0 };   // the swap in effect (for the catch log)
 static CloneOriginSwap clone_origin_begin(const uint8_t* w) {
     CloneOriginSwap s{ nullptr, 0, 0 };
     if (g_cloneSwapNow.p) return s;              // already swapped (resetScriptOrigin inside stepSwing)
@@ -4230,7 +4241,7 @@ static void clone_origin_end(const CloneOriginSwap& s) {
 // Weapon::doCollision also catches a returning weapon that touches its parent, which for the shadow's axe is
 // you, wherever the shadow is: that catch is ignored, and the shadow's axe is caught only when it reaches the
 // shadow (the proximity catch in Weapon::resetScriptOrigin, run with the shadow's position swapped in).
-static int g_inResetOrigin = 0;
+static thread_local int g_inResetOrigin = 0;
 typedef void (__fastcall *endDaggerThrow_t)(void* self, void* edx);
 static endDaggerThrow_t g_endThrowTramp = nullptr;
 static void __fastcall det_endDaggerThrow(void* self, void* edx) {
@@ -4274,6 +4285,8 @@ static void __cdecl clone_record(uint8_t* w, int a, int b, int c, float f) {
     *slot = CloneSwing{ p, { sp[0], sp[1] }, g_cloneFrame + CLONE_DELAY, a, b, c, f, false, 0, false, x, y };
     slot->orig = w; slot->rec = g_cloneFrame; slot->hn = 0; slot->aim = -1; slot->stopAt = -1; slot->holyAt = -1;
     slot->smallBomb = is_small_bomb(*reinterpret_cast<void**>(p + 0x76c0));    // Player::currWeaponItem
+    slot->level = *reinterpret_cast<void**>(p + OFF_ENT_LEVEL2);
+    slot->epoch = g_levelEpoch;
 }
 // Player::stopAttack lets go of your current weapon (a bow fires, a bomb is thrown) with Weapon::stopSwing,
 // and then did the same for the shadow's weapons in its clone list, which is no longer used. Note when it
@@ -4293,7 +4306,7 @@ static void __fastcall det_stopSwing(void* self, void* edx) {
 // with serverPreparedDivineWeapon +0x7960), which fires without using a charge. All of it is put back after.
 static void* g_lastDmgTramp = nullptr;
 static float g_ldXmm1 = 0;
-static int g_holyReplay = 0;
+static thread_local int g_holyReplay = 0;
 typedef void* (__thiscall *getStatus_t)(void* unit, int type);
 static void __cdecl holy_note(uint8_t* p, float speed) {
     if (g_holyReplay || !is_player_any(p) || *reinterpret_cast<int*>(p + 0xb80) <= 0) return;
@@ -4355,10 +4368,10 @@ static void holy_replay(CloneSwing& c, uint8_t* w) {
 typedef void (__fastcall *bearStomp_t)(void* p, void* edx, int landed);
 static bearStomp_t g_stompTramp = nullptr;
 struct StompReplay { uint8_t* p; int due; };
-static StompReplay g_stomps[8];
-static int g_stompReplay = 0;
+static thread_local StompReplay g_stomps[8];
+static thread_local int g_stompReplay = 0;
 struct TreeHead { void* l; void* par; void* r; uint8_t color, isnil, pad[2]; void* val[2]; };
-static TreeHead g_emptyHead;
+static thread_local TreeHead g_emptyHead;
 static void __fastcall det_stopBearStomp(void* self, void* edx, int landed) {
     uint8_t* p = static_cast<uint8_t*>(self);
     if (!g_stompReplay && (landed & 0xff) && p[0x990] && is_player_any(p) && *reinterpret_cast<int*>(p + 0xb80) > 0)
@@ -4372,7 +4385,7 @@ static void __fastcall det_stopBearStomp(void* self, void* edx, int landed) {
 // Player::doCollision hurts an enemy you stomp on (vtable +0x60) with you as the source and no attacker, while
 // the stomp (+0x990) is still on.
 struct StompHit { const uint8_t* p; uint8_t meta[0x1c]; };
-static StompHit g_stompHits[4];
+static thread_local StompHit g_stompHits[4];
 static void stomp_note_hit(const uint8_t* meta) {
     const uint8_t* inst = *reinterpret_cast<const uint8_t* const*>(meta + 0xc);     // the source: you
     if (!inst || g_stompReplay || !is_player_any(inst) || !inst[0x990] || *reinterpret_cast<const int*>(inst + 0xb80) <= 0) return;
@@ -4512,8 +4525,8 @@ static bool clone_small_bomb_weapon(const uint8_t* w) {
 // (deathEffect), so a flagged bomb vanished on landing. They're told apart by this list instead (an entry
 // is dropped when its bomb explodes), for the small-bomb look and half damage.
 struct ShadowBomb { const uint8_t* proj; bool isSmall; };
-static ShadowBomb g_shadowBombs[16];
-static int g_shadowBombNext = 0;
+static thread_local ShadowBomb g_shadowBombs[16];
+static thread_local int g_shadowBombNext = 0;
 static ShadowBomb* shadow_bomb_entry(const uint8_t* proj) {
     if (!proj || proj[0x1f8] != 14) return nullptr;                         // PROJECTILE_BOMB
     for (auto& q : g_shadowBombs) if (q.proj == proj) return &q;
@@ -4563,12 +4576,23 @@ __declspec(naked) static void det_playerStartSwing() {
 }
 static void clone_tick() {
     ++g_cloneFrame;
+    static thread_local long s_epoch = 0;
+    const long epoch = g_levelEpoch;
+    if (epoch != s_epoch) {                       // a level loaded: stomps waiting to replay are from the old one
+        s_epoch = epoch;
+        for (auto& st : g_stomps) st = StompReplay{};
+    }
     stomp_tick();
     for (auto& c : g_clones) {
         if (!c.player) continue;
         uint8_t* p = c.player;
         uint8_t* w = static_cast<uint8_t*>(c.sp[0]);
         if (!is_player_any(p) || *reinterpret_cast<int*>(p + 0xb80) <= 0) { clone_free(c); continue; }
+        if (c.epoch != epoch || *reinterpret_cast<void**>(p + OFF_ENT_LEVEL2) != c.level) {
+            logmsg("[brutalist] party: level changed, shadow swing dropped (%s)", c.started ? "under way" : "not started");
+            clone_free(c);
+            continue;
+        }
         if (c.orig) {   // follow your swing while that weapon is still your current one
             if (*reinterpret_cast<uint8_t**>(p + OFF_PLAYER_CURRWEAPON) != c.orig) c.orig = nullptr;
             else {
@@ -4722,7 +4746,7 @@ static void __fastcall det_jarvisMarch(const void* in, void* out) {
 // swings had nowhere to come from. The game's own pushes are noted; a Party player that didn't get one this frame
 // gets it from woodsman_tick instead, the same way.
 struct ShadowPushMark { const uint8_t* p; int frame; };
-static ShadowPushMark g_shadowPushed[8];
+static thread_local ShadowPushMark g_shadowPushed[8];
 typedef void (__fastcall *playerVoid2_t)(void* self, void* edx);
 static void __fastcall det_pushShadowClone(uint8_t* p, void*) {
     ShadowPushMark* m = nullptr;
@@ -4817,8 +4841,17 @@ static void woodsman_tick_ge(uint8_t* g);
 static void woodsman_tick() {
     clone_tick();
     if (g_ge) woodsman_tick_ge(reinterpret_cast<uint8_t*>(g_ge));
-    void* srv = g_lastServer;
-    if (srv && GetTickCount() - g_lastServerStep <= 500) woodsman_tick_ge(static_cast<uint8_t*>(srv) + OFF_SERVER_GE);
+}
+// The server's game on an MP host, on the server thread (Server::step): the same per-frame work for its
+// players. Its shadows' swings add entities and projectiles to the server's level, so they must run on the
+// thread that owns it (from the client thread they raced the server's own updates: heap corruption).
+static void sunder_tick_level(void* level, void* skip);
+static void woodsman_server_tick(void* server) {
+    if (!server) return;
+    uint8_t* sge = static_cast<uint8_t*>(server) + OFF_SERVER_GE;
+    clone_tick();
+    woodsman_tick_ge(sge);
+    sunder_tick_level(*reinterpret_cast<void**>(sge + OFF_GE_LEVEL), nullptr);
 }
 static void woodsman_tick_ge(uint8_t* g) {
     uint8_t* pb = *reinterpret_cast<uint8_t**>(g + OFF_GE_PLAYERS_BEGIN);
@@ -4891,19 +4924,13 @@ static void sunder_add(uint8_t* unit, float amount) {
     logmsg("[brutalist] sunder %p: %d stacks, defense now %d", unit, s->n, *reinterpret_cast<int*>(unit + 0x21c));
 }
 // Every frame: drop expired stacks. An entry whose level is gone, or whose enemy left the level (died and
-// was removed), is forgotten without touching it.
-static void sunder_tick() {
-    void* level = current_level();
-    // On an MP host the hits (and so the stacks) are in the server's game, whose level is a different object.
-    void* srvLevel = nullptr;
-    if (void* srv = g_lastServer)
-        if (GetTickCount() - g_lastServerStep <= 500)
-            srvLevel = *reinterpret_cast<void**>(static_cast<uint8_t*>(srv) + OFF_SERVER_GE + OFF_GE_LEVEL);
+// was removed), is forgotten without touching it. Each game does its own level on its own thread: on an MP
+// host the hits (and so the stacks) are in the server's game, run from woodsman_server_tick.
+static void sunder_tick_level(void* level, void* skip) {
     const DWORD now = GetTickCount();
     for (auto& s : g_sunder) {
-        if (!s.unit) continue;
-        void* lv = (s.level == srvLevel && srvLevel) ? srvLevel : level;
-        if (s.level != lv || !unit_in_level(s.unit, static_cast<uint8_t*>(lv))) { s.unit = nullptr; continue; }
+        if (!s.unit || (skip && s.level == skip)) continue;
+        if (s.level != level || !unit_in_level(s.unit, static_cast<uint8_t*>(level))) { s.unit = nullptr; continue; }
         int k = 0;
         for (int i = 0; i < s.n; ++i) if ((int)(s.st[i].expires - now) > 0) s.st[k++] = s.st[i];
         if (k == s.n) continue;
@@ -4911,6 +4938,13 @@ static void sunder_tick() {
         sunder_apply(s);
         if (!s.n) s.unit = nullptr;
     }
+}
+static void sunder_tick() {
+    void* srvLevel = nullptr;                     // the server thread's (left alone here)
+    if (void* srv = g_lastServer)
+        if (GetTickCount() - g_lastServerStep <= 500)
+            srvLevel = *reinterpret_cast<void**>(static_cast<uint8_t*>(srv) + OFF_SERVER_GE + OFF_GE_LEVEL);
+    sunder_tick_level(current_level(), srvLevel);
 }
 
 // -- Unit::hurt pieces (called from det_unitHurt) --
@@ -6325,6 +6359,7 @@ __declspec(naked) static void det_log_intermission() {
     }
 }
 static void __cdecl wlog_loadNext(void* ge, void* level, void* ret) {
+    InterlockedIncrement(&g_levelEpoch);   // Party shadow swings from the old level are dropped (clone_tick)
     int f = ge ? *reinterpret_cast<int*>(reinterpret_cast<uint8_t*>(ge) + OFF_FLOORINDEX) : -1;
     logmsg("[win] loadNextLevel ge=%p floorIndex(before inc)=%d level=%p caller_rva=0x%x",
            ge, f, level, (unsigned)((uintptr_t)ret - g_base));
