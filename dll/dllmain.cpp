@@ -881,7 +881,7 @@ static bool ini_mtime(FILETIME* out) {
 //   Keys are unique across sections (the manager relies on that too), so overrides key on name only.
 static volatile DWORD g_lastServerStep = 0;   // updated every Server::step; recent => this instance is the MP host
 static void* volatile g_lastServer = nullptr;  // the Server that ran that step (its GameEngine is the authoritative one)
-static const char* const VULTRA_VERSION = "1.5.0-dev";   // bump on any change to what syncs or how
+static const char* const VULTRA_VERSION = "1.5.1";   // bump on any change to what syncs or how
 struct CfgKV { char key[40]; char val[24]; };
 static const int CFG_MAX = 128;
 static CfgKV g_cfgSnap[CFG_MAX]; static int g_cfgSnapN = 0;   // last load_config's effective values
@@ -2547,6 +2547,14 @@ static void __fastcall do_addEntity(void* level, void* /*edx*/, void* spRef) {
     if (entity && g_shadowActing) {
         void* ctrl = reinterpret_cast<void**>(spRef)[1];
         shadow_ent_add(entity, ctrl);
+        // In co-op the shadow also runs in the server's game, whose arrows, bombs and spells are real and reach
+        // every game; a copy made in a game that only shows things (entity +0xa2, client side) would be a
+        // harmless second one on screen, so it goes.
+        const uint8_t etype = *reinterpret_cast<uint8_t*>((uint8_t*)entity + 0x50);
+        if (static_cast<uint8_t*>(entity)[0xa2] && etype != 109 && etype != 90) {      // not dust, not a weapon
+            static_cast<uint8_t*>(entity)[0x148] = 1;                                   // Entity::die
+            logmsg("[brutalist] party: shadow's type %d in a display-only game removed (the server's is real)", etype);
+        }
         const float* ef = reinterpret_cast<const float*>(static_cast<uint8_t*>(entity) + 0xac);
         if (*reinterpret_cast<uint8_t*>((uint8_t*)entity + 0x50) != 109)          // not every dust particle
         logmsg("[brutalist] party: shadow made entity type %d (%p) at %.0f,%.0f size %.0fx%.0f", *reinterpret_cast<uint8_t*>((uint8_t*)entity + 0x50),
@@ -3022,8 +3030,7 @@ static void __fastcall det_projSetState(void* self, void* edx, void* st) {
     uint8_t* p = static_cast<uint8_t*>(self);
     if (!st || p[0x1f8] != 14) return;
     const uint8_t isSmall = (*reinterpret_cast<uint32_t*>(static_cast<uint8_t*>(st) + 0x20) & SMALL_PROJ_NET_BIT) ? 1 : 0;
-    static const void* lastLogged = nullptr;
-    if (isSmall && lastLogged != p) { lastLogged = p; logmsg("[smallbomb] net bomb %p is small (item %p)", p, *reinterpret_cast<void**>(p + 0x284)); }
+    if (isSmall && p[OFF_PROJ_SMALL_NET] != 1) logmsg("[smallbomb] net bomb %p is small (item %p)", p, *reinterpret_cast<void**>(p + 0x284));
     p[OFF_PROJ_SMALL_NET] = isSmall;
 }
 static void __fastcall det_projDraw(void* self, void* edx, void* rt) {
@@ -3066,6 +3073,7 @@ __declspec(naked) static void det_itemDrawAt() {
 // came from (Player::currWeaponItem, +0x76c0) is a small bomb, draw it yellow; otherwise put back the
 // stock texture, in case the same weapon is later used for a regular bomb.
 static bool is_player_entity(const void* ent);   // (Bomber tree, below)
+static bool is_player_any(const void* ent);      // (Bomber tree, below)
 static void sprite_from_yellow(uint8_t* spr) {
     if (!spr) return;
     void*& tex = *reinterpret_cast<void**>(spr + 0xfc);
@@ -3076,7 +3084,7 @@ static void __cdecl small_bomb_weapon_sprite(uint8_t* w) {
     uint8_t* p = *reinterpret_cast<uint8_t**>(w + 0x248);              // Weapon::parent
     // A player first (a pointer compare): a weapon can outlive its wielder (a lobby character re-made by
     // the class picker), and reading through a freed parent crashed the draw.
-    if (!is_player_entity(p)) return;
+    if (!is_player_any(p)) return;
     const bool shadow = w[0x29c] != 0;     // a Party shadow's copy: small if the bomb you wound up was
     if (!shadow && *reinterpret_cast<uint8_t**>(p + OFF_PLAYER_CURRWEAPON_SB) != w) return;
     // The bomb in hand is the weapon's waiting projectile (Weapon::currProjectile, +0x258; a bomb, type 14,
@@ -3148,6 +3156,66 @@ __declspec(naked) static void stub_stackSameType() {
         ret
     }
 }
+// Inventory::doStackItem starts with haveItemOfType(type) and, when that's true, runs Item::pickUp on the new
+// item before looking for the stack to add it to. With small and regular bombs stacking apart, a regular bomb
+// picked up while you only hold small ones passed that check, found no stack, and the pickup then failed
+// after the item had already been taken: it vanished. This stands in for that call (0x6096a1): true only
+// when the bag holds a stack the new item really joins (same type and same small flag). edi = the new item.
+static int __cdecl have_matching_stack(const uint8_t* inv, const uint8_t* item) {
+    uint8_t* const* cols = *reinterpret_cast<uint8_t* const* const*>(inv + 0x300);   // [7] columns of 5 shared_ptr<Item>
+    if (!cols || !item) return 0;
+    const int type = *reinterpret_cast<const int*>(item + 0x20c);
+    for (int c = 0; c < 7; c++)
+        for (int r = 0; r < 5; r++) {
+            const uint8_t* it = *reinterpret_cast<uint8_t* const*>(cols[c] + r * 8);
+            if (it && it != item && *reinterpret_cast<const int*>(it + 0x20c) == type && it[OFF_ITEM_SMALL] == item[OFF_ITEM_SMALL])
+                return 1;
+        }
+    return 0;
+}
+__declspec(naked) static void stub_haveStackable() {    // thiscall ecx = inventory, [esp+4] = type, ret 4
+    __asm {
+        push edx
+        push edi
+        push ecx
+        call have_matching_stack
+        add  esp, 8
+        pop  edx
+        ret  4
+    }
+}
+// Dropping one item off a stack (Inventory::dropItemAt, 0x60e058) lowers the stack's count and makes a fresh
+// item of the same type for the floor (make_shared<Item>(x, y, type), 0x42dad0), so one small bomb dropped
+// off a small stack became a regular bomb. The call is wrapped: after it, the new item takes the old one's
+// small flag (and its cost and look). ebx = the stack being dropped from, ecx = &result.
+static uintptr_t g_dropMakeRet = 0;
+static uint8_t* g_dropMakeOld = nullptr;
+static void** g_dropMakeRes = nullptr;
+static void __cdecl drop_one_keep_small(void** res, const uint8_t* old) {
+    uint8_t* item = res ? static_cast<uint8_t*>(res[0]) : nullptr;
+    if (!item || !old || old[OFF_ITEM_SMALL] != 1) return;
+    item[OFF_ITEM_SMALL] = 1;
+    det_setCost(item, nullptr);
+    small_bomb_dress(item);
+    logmsg("[smallbomb] dropped one small bomb off a stack: %p stays small", item);
+}
+__declspec(naked) static void stub_dropMakeItem() {
+    __asm {
+        pop  dword ptr [g_dropMakeRet]
+        mov  dword ptr [g_dropMakeOld], ebx
+        mov  dword ptr [g_dropMakeRes], ecx
+        mov  eax, g_base
+        add  eax, 0x0002dad0
+        call eax                                 // make_shared<Item>(x, y, type), cdecl: args stay for the caller
+        pushad
+        push dword ptr [g_dropMakeOld]
+        push dword ptr [g_dropMakeRes]
+        call drop_one_keep_small
+        add  esp, 8
+        popad
+        jmp  dword ptr [g_dropMakeRet]
+    }
+}
 // Item::use: `cmp eax,0x64; jne next` is "using a bomb on something" (bomb + arrows = bomb arrows).
 // A small bomb takes the not-a-bomb branch. eax = this item's type, esi = this.
 static uintptr_t g_useBombCase = 0, g_useNotBomb = 0;
@@ -3207,6 +3275,10 @@ static void install_small_bomb() {
     jmpPatch("kill: bomb explosion", 0x0032eb28, k, sizeof(k), 0xE9, (void*)&det_killBomb);
     const uint8_t s[] = {0x8B,0x81,0x0C,0x02,0x00,0x00,0x3B,0x87,0x0C,0x02,0x00,0x00};  // mov eax,[ecx+20c]; cmp eax,[edi+20c]
     jmpPatch("doStackItem: same type", 0x0020973b, s, sizeof(s), 0xE8, (void*)&stub_stackSameType);
+    bool hs = redirect_call(0x002096a1, g_base + 0x0020f3f0, (void*)&stub_haveStackable);   // haveItemOfType
+    logmsg("[smallbomb] doStackItem: matching-stack check %s", hs ? "installed" : "FAILED");
+    bool dm = redirect_call(0x0020e058, g_base + 0x0002dad0, (void*)&stub_dropMakeItem);
+    logmsg("[smallbomb] drop one off a stack: keep small %s", dm ? "installed" : "FAILED");
     g_useBombCase = g_base + 0x00225778;
     g_useNotBomb  = g_base + 0x0022591d;
     const uint8_t u[] = {0x83,0xF8,0x64,0x0F,0x85,0xA5,0x01,0x00,0x00};                // cmp eax,0x64; jne +0x1a5
@@ -3398,7 +3470,7 @@ static void* g_axeVtbl[5];
 static affInit_t g_clubInitStrings = nullptr;
 static const char* const kAxeText[][2] = {
     { "Club", "Axe" },
-    { "Club attacks deal more damage and stun enemies more.", "Axe attacks deal more damage and stun enemies more." },
+    { "Club attacks deal more damage and stun enemies more.", "Axe attacks deal 25% more damage and stun enemies more." },
     { "Shockwave", "Axe Throw" },
     { "Fully charged attacks unleash a powerful shockwave.",
       "Hold up and attack to throw your axe. Thrown axes return to their owner." },
@@ -3622,28 +3694,36 @@ static int bomber_level_of(const void* ent) {
 // it in the explosion's net state (bit 2 of EntityState::flags2; an explosion, SpellType 3, sends only bits
 // 0-1 there) and det_spellSetState files the copy here, its caster (the thrower) as the thrower.
 static const uint32_t BOMBER_SPARES_NET_BIT = 0x4;
-static struct BombBlast { const void* spell; const void* thrower; bool spares, fromNet; } g_bombBlasts[16];
+// An entry is only good while its explosion can still be around (a couple of seconds): the address of a
+// finished one gets reused by new objects, and a weapon there counted as an Incendiary blast (axe hits set
+// enemies burning). The source must also still be a SpellEntity.
+static const DWORD BOMB_BLAST_LIFE_MS = 2000;
+static const uintptr_t RVA_SPELLENTITY_VTABLE = 0x0071ef58;   // SpellEntity::`vftable'
+static struct BombBlast { const void* spell; const void* thrower; bool spares, fromNet; DWORD at; } g_bombBlasts[16];
 static int g_bombBlastNext = 0;
 static BombBlast* bomb_blast_entry(const void* spell) {
-    for (auto& b : g_bombBlasts) if (b.spell && b.spell == spell) return &b;
+    if (!spell || *static_cast<const uintptr_t*>(spell) != g_base + RVA_SPELLENTITY_VTABLE) return nullptr;
+    const DWORD now = GetTickCount();
+    for (auto& b : g_bombBlasts) if (b.spell && b.spell == spell && now - b.at <= BOMB_BLAST_LIFE_MS) return &b;
     return nullptr;
 }
 static void bomb_blast_record(const void* spell, const void* thrower, bool spares, bool fromNet) {
     BombBlast* b = bomb_blast_entry(spell);
     if (!b) { b = &g_bombBlasts[g_bombBlastNext]; g_bombBlastNext = (g_bombBlastNext + 1) % 16; }
-    *b = { spell, thrower, spares, fromNet };
+    *b = { spell, thrower, spares, fromNet, GetTickCount() };
 }
+static const int INCENDIARY_BURN_FRAMES = 60;   // 3 ignitions' worth of the game's burn
 static void bomber_on_explosion(const uint8_t* proj, uint8_t* spell) {
     const void* thrower = *reinterpret_cast<void* const*>(proj + 0x2a4);   // Projectile::instigator
     const bool incendiary = bomber_level_of(thrower) >= 3;
     bomb_blast_record(spell, thrower, incendiary, false);
     if (!incendiary) return;
     // Level 3: 30% wider blast (the explosion's box, Entity w/h at +0xc0/+0xc4, grown around its centre)
-    // and fire (SpellEntity::elementalDmgAccumulationFire; each hit adds 2.5x this, 1.0 ignites).
+    // and fire: everything the blast hurts is set burning in det_unitHurt (explosions don't feed the spell's
+    // elementalDmgAccumulationFire into the target, so setting that did nothing).
     float* x = reinterpret_cast<float*>(spell + 0xac); float* y = reinterpret_cast<float*>(spell + 0xb0);
     float* w = reinterpret_cast<float*>(spell + 0xc0); float* h = reinterpret_cast<float*>(spell + 0xc4);
     *x -= *w * 0.15f; *y -= *h * 0.15f; *w *= 1.3f; *h *= 1.3f;
-    *reinterpret_cast<float*>(spell + 0x20c) = 1.0f;
     logmsg("[bomber] incendiary blast %.0fx%.0f", *w, *h);
 }
 static const void* bomb_blast_thrower(const void* source) {
@@ -3712,7 +3792,8 @@ static void bomb_hit_remember(const void* unit, const void* thrower) {
     g_bombHitNext = (g_bombHitNext + 1) % 32;
 }
 static const void* bomb_fire_thrower(const uint8_t* unit) {
-    if (!unit[0x213]) return nullptr;                                      // Unit::burning
+    typedef bool (__fastcall *hasStatus_t)(const void* self, void* edx, int type);   // Unit::hasStatusEffect, ret 4
+    if (!reinterpret_cast<hasStatus_t>(g_base + 0x003e8410)(unit, nullptr, 6)) return nullptr;   // STATUS_BURNING
     for (const auto& h : g_bombHits)
         if (h.unit == unit && GetTickCount() - h.tick <= BOMB_FIRE_CREDIT_MS) return h.thrower;
     return nullptr;
@@ -3733,6 +3814,27 @@ static void drop_bomb_at(void* level, float x, float y, bool smallBomb) {
     g_addEntityTramp(level, &sp);
     release_shared_block(sp[1]);
 }
+// Unit::addStatusEffect(type, frames, shared_ptr<Entity> source) + xmm3 magnitude, thiscall, ret 0x10 (0x3e7f40).
+// Called where damage is decided (the host's server game in co-op); the game sends status effects to the others
+// in the entity state. STATUS_BURNING 6 (each ignition is 20 frames), STATUS_FAIRY_FIRE 10 (the green glow).
+static const int STATUS_BURNING = 6, STATUS_FAIRY_FIRE = 10;
+__declspec(naked) static void unit_add_status(void* unit, int type, int frames, float magnitude) {
+    __asm {
+        push ebp
+        mov  ebp, esp
+        movss xmm3, dword ptr [ebp+0x14]
+        push 0                          // source: empty shared_ptr
+        push 0
+        push dword ptr [ebp+0x10]
+        push dword ptr [ebp+0x0c]
+        mov  ecx, dword ptr [ebp+0x08]
+        mov  eax, g_base
+        add  eax, 0x003e7f40
+        call eax
+        pop  ebp
+        ret
+    }
+}
 typedef int (__fastcall *unitHurt_t)(void* self, void* edx, const void* meta);
 static unitHurt_t g_unitHurtTramp = nullptr;
 static void stomp_note_hit(const uint8_t* meta);   // (Party, below)
@@ -3748,7 +3850,7 @@ static int __fastcall det_unitHurt(void* self, void* edx, const void* meta) {
     const void* bombThrower = bomb_blast_thrower(source);                          // its blast
     if (!bombThrower) bombThrower = bomb_projectile_thrower(source);               // a direct hit
     alignas(4) uint8_t metaCopy[0x20];
-    const bool enemy = target && m && !is_player_entity(u);
+    const bool enemy = target && m && !is_player_any(u);
     const void* useMeta = enemy ? brutalist_pre_hurt(u, m, metaCopy) : meta;   // Executioner may raise it
     alignas(4) uint8_t halfCopy[0x20];
     if (m && shadow_ent_is(source)) {          // Party: the shadow's arrows, shots and spells hit for half
@@ -3761,9 +3863,20 @@ static int __fastcall det_unitHurt(void* self, void* edx, const void* meta) {
                static_cast<const uint8_t*>(source) + 0x50), u, *d, was);
     }
     if (enemy) stomp_note_hit(static_cast<const uint8_t*>(useMeta));     // Party: your stomp's landing hit
+    // Contact Fuse: a level 4 bomb that hits an enemy goes off, also for enemies the per-step check can't see
+    // (bosses like the baby dragon aren't in the level's targetable monster list).
+    if (enemy && bomb_projectile_thrower(source) && bomber_level_of(bomb_projectile_thrower(source)) >= 4) {
+        int* fuse = reinterpret_cast<int*>(const_cast<uint8_t*>(static_cast<const uint8_t*>(source)) + 0x244);
+        if (*fuse > 0) { *fuse = 0; logmsg("[bomber] contact fuse: direct hit on %p", u); }
+    }
     int r = g_unitHurtTramp(self, edx, useMeta);
     if (enemy) brutalist_post_hurt(u, static_cast<const uint8_t*>(useMeta), hp0);   // Momentum, Sunder
-    if (!target || u[0xa2] || !meta || is_player_entity(u)) return r;
+    // Incendiary: the blast sets what it hits burning (the game's own burn, so it looks and spreads as normal fire).
+    if (enemy && !u[0xa2] && *reinterpret_cast<float*>(u + 0x10c) > 0.0f) {
+        const BombBlast* bb = bomb_blast_entry(source);
+        if (bb && bb->spares) { unit_add_status(u, STATUS_BURNING, INCENDIARY_BURN_FRAMES, 0.05f); logmsg("[bomber] incendiary: %p set burning", u); }
+    }
+    if (!target || u[0xa2] || !meta || is_player_any(u)) return r;
     if (bombThrower && hp0 > 0.0f) bomb_hit_remember(u, bombThrower);
     if (hp0 <= 0.0f || *reinterpret_cast<float*>(u + 0x10c) > 0.0f) return r;
     const void* killer = *reinterpret_cast<void* const*>(m + 0x14);       // DamageEventMeta::instigator
@@ -3954,7 +4067,7 @@ static void woodsman_stats(uint8_t* p) {
     static struct { const uint8_t* player; int level; } seen[8];
     int slot = -1;
     for (int i = 0; i < 8 && slot < 0; ++i) if (seen[i].player == p) slot = i;
-    if (slot < 0) for (int i = 0; i < 8 && slot < 0; ++i) if (!seen[i].player || !is_player_entity(seen[i].player)) {
+    if (slot < 0) for (int i = 0; i < 8 && slot < 0; ++i) if (!seen[i].player || !is_player_any(seen[i].player)) {
         slot = i; seen[i].player = p; seen[i].level = 0;
     }
     if (slot >= 0 && scav != seen[slot].level) {
@@ -4012,6 +4125,9 @@ struct CloneSwing { uint8_t* player; void* sp[2]; int due; int a, b, c; float f;
     // button, which only reaches your own weapon (Weapon::canActivateWand +0x224 and chargingAttack +0x28c,
     // per frame from your startSwing), and a throw's aim byte (+0x2a7, see axe_latch_aim).
     uint8_t* orig; int rec, hn, aim; uint8_t h224[256], h28c[256];
+    // Your weapon's aim angle (+0x2d0) each frame: the game turns only the aim of the weapon you hold, from
+    // your up/down keys, so the shadow's bow never aimed. Replayed on the copy at the same point.
+    float h2d0[256];
     // An axe's charge is switched on by Player::attack just after startSwing (axe_charge_apply), so the copy
     // made at startSwing never had it: the charge flag, its hold keyframe (+0x290) and head start (+0x294)
     // are taken from your weapon the first frame it charges and put on the copy at the same point.
@@ -4059,7 +4175,7 @@ static CloneTrail g_trails[8];
 static void clone_trail_push(const uint8_t* p) {
     CloneTrail* t = nullptr;
     for (auto& tr : g_trails) if (tr.p == p) { t = &tr; break; }
-    if (!t) for (auto& tr : g_trails) if (!tr.p || !is_player_entity(const_cast<uint8_t*>(tr.p))) { tr = CloneTrail{}; tr.p = p; t = &tr; break; }
+    if (!t) for (auto& tr : g_trails) if (!tr.p || !is_player_any(const_cast<uint8_t*>(tr.p))) { tr = CloneTrail{}; tr.p = p; t = &tr; break; }
     if (!t) return;
     t->pos[t->head][0] = *reinterpret_cast<const float*>(p + 0xac);
     t->pos[t->head][1] = *reinterpret_cast<const float*>(p + 0xb0);
@@ -4123,7 +4239,7 @@ static void __fastcall det_endDaggerThrow(void* self, void* edx) {
         if (!g_inResetOrigin) return;                            // touched you, not the shadow: keep flying
         uint8_t* p = *reinterpret_cast<uint8_t**>(w + 0x248);
         float bd[2] = { 0, 0 };
-        if (is_player_entity(p)) clone_body(p, bd);
+        if (is_player_any(p)) clone_body(p, bd);
         logmsg("[brutalist] party: frame %d shadow caught its thrown weapon at %.0f,%.0f (shadow at %.0f,%.0f, you at %.0f,%.0f)", g_cloneFrame,
                *reinterpret_cast<float*>(w + 0x344), *reinterpret_cast<float*>(w + 0x348), bd[0], bd[1],
                g_cloneSwapNow.p == p ? g_cloneSwapNow.x : 0.f, g_cloneSwapNow.p == p ? g_cloneSwapNow.y : 0.f);
@@ -4131,6 +4247,14 @@ static void __fastcall det_endDaggerThrow(void* self, void* edx) {
         return;
     }
     g_endThrowTramp(self, edx);
+    // In co-op a player's copy on another game (and the host's own player in its local game) swings by the
+    // server's updates, and its swing can still be running when the axe comes back: with the throw flag still
+    // set, the swing threw it again (a full charge threw three times, slowing you each time). Caught means
+    // this swing's throw is done.
+    if (w[0x269] && w[0x2a5]) {
+        w[0x2a5] = 0;
+        logmsg("[axe] caught mid-swing: no second throw (weapon %p)", w);
+    }
 }
 static void clone_free(CloneSwing& c) {
     if (c.sp[0] && c.started) static_cast<uint8_t*>(c.sp[0])[0x148] = 1;   // Entity::die: the level drops it
@@ -4139,7 +4263,7 @@ static void clone_free(CloneSwing& c) {
 }
 static void __cdecl clone_record(uint8_t* w, int a, int b, int c, float f) {
     uint8_t* p = *reinterpret_cast<uint8_t**>(w + 0x248);                   // Weapon::parent
-    if (!is_player_entity(p) || *reinterpret_cast<int*>(p + 0xb80) <= 0) return;
+    if (!is_player_any(p) || *reinterpret_cast<int*>(p + 0xb80) <= 0) return;
     CloneSwing* slot = nullptr;
     for (auto& cs : g_clones) if (!cs.player) { slot = &cs; break; }
     if (!slot) return;
@@ -4172,7 +4296,7 @@ static float g_ldXmm1 = 0;
 static int g_holyReplay = 0;
 typedef void* (__thiscall *getStatus_t)(void* unit, int type);
 static void __cdecl holy_note(uint8_t* p, float speed) {
-    if (g_holyReplay || !is_player_entity(p) || *reinterpret_cast<int*>(p + 0xb80) <= 0) return;
+    if (g_holyReplay || !is_player_any(p) || *reinterpret_cast<int*>(p + 0xb80) <= 0) return;
     uint8_t* w = *reinterpret_cast<uint8_t**>(p + OFF_PLAYER_CURRWEAPON);
     if (!w || p[0x808] || !*reinterpret_cast<int*>(p + 0xa08)) return;     // isSkeleton, no Divine Weapon
     const uint8_t* script = *reinterpret_cast<uint8_t**>(w + 0x318);
@@ -4237,7 +4361,7 @@ struct TreeHead { void* l; void* par; void* r; uint8_t color, isnil, pad[2]; voi
 static TreeHead g_emptyHead;
 static void __fastcall det_stopBearStomp(void* self, void* edx, int landed) {
     uint8_t* p = static_cast<uint8_t*>(self);
-    if (!g_stompReplay && (landed & 0xff) && p[0x990] && is_player_entity(p) && *reinterpret_cast<int*>(p + 0xb80) > 0)
+    if (!g_stompReplay && (landed & 0xff) && p[0x990] && is_player_any(p) && *reinterpret_cast<int*>(p + 0xb80) > 0)
         for (auto& st : g_stomps)
             if (!st.p) { st = StompReplay{ p, g_cloneFrame + CLONE_DELAY }; logmsg("[brutalist] party: your stomp landed"); break; }
     g_stompTramp(self, edx, landed);
@@ -4251,10 +4375,10 @@ struct StompHit { const uint8_t* p; uint8_t meta[0x1c]; };
 static StompHit g_stompHits[4];
 static void stomp_note_hit(const uint8_t* meta) {
     const uint8_t* inst = *reinterpret_cast<const uint8_t* const*>(meta + 0xc);     // the source: you
-    if (!inst || g_stompReplay || !is_player_entity(inst) || !inst[0x990] || *reinterpret_cast<const int*>(inst + 0xb80) <= 0) return;
+    if (!inst || g_stompReplay || !is_player_any(inst) || !inst[0x990] || *reinterpret_cast<const int*>(inst + 0xb80) <= 0) return;
     StompHit* h = nullptr;
     for (auto& x : g_stompHits) if (x.p == inst) { h = &x; break; }
-    if (!h) for (auto& x : g_stompHits) if (!x.p || !is_player_entity(x.p)) { h = &x; break; }
+    if (!h) for (auto& x : g_stompHits) if (!x.p || !is_player_any(x.p)) { h = &x; break; }
     if (!h) return;
     h->p = inst;
     memcpy(h->meta, meta, 0x1c);
@@ -4295,7 +4419,7 @@ static void stomp_tick() {
         uint8_t* p = st.p;
         st = StompReplay{};
         float body[2];
-        if (!is_player_entity(p) || *reinterpret_cast<int*>(p + 0xb80) <= 0 || !clone_body(p, body)) continue;
+        if (!is_player_any(p) || *reinterpret_cast<int*>(p + 0xb80) <= 0 || !clone_body(p, body)) continue;
         const float x = *reinterpret_cast<float*>(p + 0xac), y = *reinterpret_cast<float*>(p + 0xb0);
         const uint8_t stomping = p[0x990], net = p[0xc99];
         void** head = reinterpret_cast<void**>(p + 0x78fc);
@@ -4444,12 +4568,15 @@ static void clone_tick() {
         if (!c.player) continue;
         uint8_t* p = c.player;
         uint8_t* w = static_cast<uint8_t*>(c.sp[0]);
-        if (!is_player_entity(p) || *reinterpret_cast<int*>(p + 0xb80) <= 0) { clone_free(c); continue; }
+        if (!is_player_any(p) || *reinterpret_cast<int*>(p + 0xb80) <= 0) { clone_free(c); continue; }
         if (c.orig) {   // follow your swing while that weapon is still your current one
             if (*reinterpret_cast<uint8_t**>(p + OFF_PLAYER_CURRWEAPON) != c.orig) c.orig = nullptr;
             else {
                 const int r = g_cloneFrame - c.rec;
-                if (r >= 0 && r < 256) { c.h224[r] = c.orig[0x224]; c.h28c[r] = c.orig[0x28c]; c.hn = r + 1; }
+                if (r >= 0 && r < 256) {
+                    c.h224[r] = c.orig[0x224]; c.h28c[r] = c.orig[0x28c];
+                    c.h2d0[r] = *reinterpret_cast<float*>(c.orig + 0x2d0); c.hn = r + 1;
+                }
                 if (!c.capSet && c.orig[0x28c]) {
                     c.capSet = true;
                     c.cap290 = *reinterpret_cast<int*>(c.orig + 0x290);
@@ -4506,6 +4633,11 @@ static void clone_tick() {
                 *reinterpret_cast<int*>(w + 0x294) = c.cap294;
             }
         } else if (!c.orig) w[0x28c] = 0;         // your swing is over: so is any charge
+        if (!w[0x2a6] && c.hn > 0) {             // your aim, the same number of frames in (held at its last)
+            *reinterpret_cast<float*>(w + 0x2d0) = c.h2d0[c.age < c.hn ? c.age : c.hn - 1];
+            *reinterpret_cast<float*>(w + 0x2cc) = 0.0f;                         // aim speed
+            w[0x210] = 0; w[0x211] = 0; w[0x2c4] = 0;                            // aiming up / down / to a target
+        }
         if (c.stopAt >= 0 && c.age >= c.stopAt && !c.stopped) {   // you let go here: fire / throw
             c.stopped = true;
             uint8_t* proj = *reinterpret_cast<uint8_t**>(w + 0x258);             // Weapon::currProjectile
@@ -4523,8 +4655,9 @@ static void clone_tick() {
             g_stopSwingTramp(w, nullptr);
             --g_shadowActing;
             clone_origin_end(s);
-            if (proj) logmsg("[brutalist] party: frame %d shadow let go (%s, %d frames in)", g_cloneFrame,
-                             proj[0x1f8] == 14 ? (c.smallBomb ? "small bomb" : "bomb") : "arrow/shot", c.age);
+            if (proj) logmsg("[brutalist] party: frame %d shadow let go (%s, %d frames in, aim %.0f)", g_cloneFrame,
+                             proj[0x1f8] == 14 ? (c.smallBomb ? "small bomb" : "bomb") : "arrow/shot", c.age,
+                             *reinterpret_cast<float*>(w + 0x2d0));
         }
         if (c.holyAt >= 0 && c.age >= c.holyAt && !c.holyDone) { c.holyDone = true; holy_replay(c, w); }
         // A swing is advanced by its wielder (Player::step does it for your weapon and its old clone list).
@@ -4594,7 +4727,7 @@ typedef void (__fastcall *playerVoid2_t)(void* self, void* edx);
 static void __fastcall det_pushShadowClone(uint8_t* p, void*) {
     ShadowPushMark* m = nullptr;
     for (auto& s : g_shadowPushed) if (s.p == p) { m = &s; break; }
-    if (!m) for (auto& s : g_shadowPushed) if (!s.p || !is_player_entity(const_cast<uint8_t*>(s.p))) { m = &s; break; }
+    if (!m) for (auto& s : g_shadowPushed) if (!s.p || !is_player_any(const_cast<uint8_t*>(s.p))) { m = &s; break; }
     if (m) { m->p = p; m->frame = g_cloneFrame; }
     reinterpret_cast<playerVoid2_t>(g_base + 0x002fe040)(p, nullptr);
 }
@@ -4678,10 +4811,16 @@ static void axe_unstick(uint8_t* p) {
     if (g_endThrowTramp) g_endThrowTramp(w, nullptr);
     else { w[0x2a6] = 0; w[0x269] = 0; }
 }
+static void woodsman_tick_ge(uint8_t* g);
+// Every player in this game, and on an MP host also every player in the server's game: that's where co-op
+// damage is decided, so the Party shadow, Momentum and the rest have to run on those copies too.
 static void woodsman_tick() {
     clone_tick();
-    if (!g_ge) return;
-    uint8_t* g = reinterpret_cast<uint8_t*>(g_ge);
+    if (g_ge) woodsman_tick_ge(reinterpret_cast<uint8_t*>(g_ge));
+    void* srv = g_lastServer;
+    if (srv && GetTickCount() - g_lastServerStep <= 500) woodsman_tick_ge(static_cast<uint8_t*>(srv) + OFF_SERVER_GE);
+}
+static void woodsman_tick_ge(uint8_t* g) {
     uint8_t* pb = *reinterpret_cast<uint8_t**>(g + OFF_GE_PLAYERS_BEGIN);
     uint8_t* pe = *reinterpret_cast<uint8_t**>(g + OFF_GE_PLAYERS_BEGIN + 4);
     const DWORD now = GetTickCount();
@@ -4691,7 +4830,7 @@ static void woodsman_tick() {
         const int brut = tree_level(p, AFFINITY_BRUTALIST);
         if (brut >= 4) *reinterpret_cast<int*>(p + 0xb80) = 1;    // afterimages: one shadow copy
         if (*reinterpret_cast<int*>(p + 0xb80) > 0) {
-            if (p[0xa2] && !shadow_pushed_lately(p)) shadow_push_remote(p);   // co-op: another game's player
+            if (!shadow_pushed_lately(p)) shadow_push_remote(p);   // co-op: a copy Player::step doesn't snapshot
             clone_trail_push(p);                                  // where the shadow will stand
         }
         if (!p[0xa2]) axe_unstick(p);                             // (your own player; a remote one's owner does it)
@@ -4748,16 +4887,23 @@ static void sunder_add(uint8_t* unit, float amount) {
     if (s->n == 24) { memmove(s->st, s->st + 1, sizeof(SunderStack) * 23); s->n = 23; }   // oldest out
     s->st[s->n++] = { amount, GetTickCount() + SUNDER_MS };
     sunder_apply(*s);
+    unit_add_status(unit, STATUS_FAIRY_FIRE, SUNDER_MS * 60 / 1000, 1.0f);   // the green glow while sundered
     logmsg("[brutalist] sunder %p: %d stacks, defense now %d", unit, s->n, *reinterpret_cast<int*>(unit + 0x21c));
 }
 // Every frame: drop expired stacks. An entry whose level is gone, or whose enemy left the level (died and
 // was removed), is forgotten without touching it.
 static void sunder_tick() {
     void* level = current_level();
+    // On an MP host the hits (and so the stacks) are in the server's game, whose level is a different object.
+    void* srvLevel = nullptr;
+    if (void* srv = g_lastServer)
+        if (GetTickCount() - g_lastServerStep <= 500)
+            srvLevel = *reinterpret_cast<void**>(static_cast<uint8_t*>(srv) + OFF_SERVER_GE + OFF_GE_LEVEL);
     const DWORD now = GetTickCount();
     for (auto& s : g_sunder) {
         if (!s.unit) continue;
-        if (s.level != level || !unit_in_level(s.unit, static_cast<uint8_t*>(level))) { s.unit = nullptr; continue; }
+        void* lv = (s.level == srvLevel && srvLevel) ? srvLevel : level;
+        if (s.level != lv || !unit_in_level(s.unit, static_cast<uint8_t*>(lv))) { s.unit = nullptr; continue; }
         int k = 0;
         for (int i = 0; i < s.n; ++i) if ((int)(s.st[i].expires - now) > 0) s.st[k++] = s.st[i];
         if (k == s.n) continue;
@@ -4773,7 +4919,7 @@ static void sunder_tick() {
 static const void* brutalist_pre_hurt(uint8_t* u, const uint8_t* meta, uint8_t* copy) {
     if (!meta || u[0xa2]) return meta;
     const uint8_t* inst = *reinterpret_cast<uint8_t* const*>(meta + 0x14);
-    if (!is_player_entity(inst) || tree_level(inst, AFFINITY_BRUTALIST) < 3) return meta;
+    if (!is_player_any(inst) || tree_level(inst, AFFINITY_BRUTALIST) < 3) return meta;
     const float hp = *reinterpret_cast<float*>(u + 0x10c), maxHp = *reinterpret_cast<float*>(u + 0x110);
     const int dmg = *reinterpret_cast<const int*>(meta);
     if (hp <= 0.0f || maxHp <= 0.0f || hp >= maxHp * 0.3f || dmg <= 0) return meta;
@@ -4786,7 +4932,7 @@ static const void* brutalist_pre_hurt(uint8_t* u, const uint8_t* meta, uint8_t* 
 }
 static void brutalist_post_hurt(uint8_t* u, const uint8_t* meta, float hp0) {
     const uint8_t* inst = *reinterpret_cast<uint8_t* const*>(meta + 0x14);
-    if (!is_player_entity(inst)) return;
+    if (!is_player_any(inst)) return;
     const int lvl = tree_level(inst, AFFINITY_BRUTALIST);
     if (lvl < 1) return;
     const void* source = *reinterpret_cast<void* const*>(meta + 0xc);
@@ -4943,12 +5089,19 @@ static void install_woods_trees() {
 }
 
 // Player::attack, level 1 (the stun bonus). Stock: `if (isClub) { if (clubBonusStun) <apply> } else <next
-// weapon check>`. We route the same three ways, adding "axe with Axe tree >= 1" to <apply>.
+// weapon check>`. <apply> sets the weapon's stun (+0x234) to 4 and its flat bonus damage (+0x228/+0x22c,
+// added to the min/max roll in Weapon::doCollision) to 3. An axe with Axe tree >= 1 gets the same stun but no
+// flat bonus: its hits are +25% instead, in doCollision (axe_damage_factor).
 static uintptr_t g_axeStunApply = 0, g_axeStunSkip = 0, g_axeStunNotClub = 0, g_axeStunJmp = 0;
 static uintptr_t __cdecl axe_stun_route(const uint8_t* player, const uint8_t* props) {
     if (props[0x5c] & 0x80) return player[0x9e8] ? g_axeStunApply : g_axeStunSkip;   // club, clubBonusStun
-    if (is_axe_weapon(*reinterpret_cast<uint8_t* const*>(player + OFF_PLAYER_CURRWEAPON), props) &&
-        axe_tree_level(player) >= 1) return g_axeStunApply;
+    uint8_t* w = *reinterpret_cast<uint8_t* const*>(player + OFF_PLAYER_CURRWEAPON);
+    if (is_axe_weapon(w, props) && axe_tree_level(player) >= 1) {
+        *reinterpret_cast<float*>(w + 0x234) = 4.0f;
+        *reinterpret_cast<int*>(w + 0x228) = 0;
+        *reinterpret_cast<int*>(w + 0x22c) = 0;
+        return g_axeStunSkip;
+    }
     return g_axeStunNotClub;
 }
 __declspec(naked) static void det_axeStun() {   // at Player::attack 0x2d3388: edx = props, edi = player
@@ -5222,7 +5375,7 @@ typedef void (__thiscall *spriteNoArg_t)(void* self);
 typedef void (__thiscall *rtDrawVerts_t)(void* target, const void* verts, size_t n, int type, const void* states);
 typedef void (__cdecl *tfMul_t)(void* t, const void* other);
 static bool axe_throw_wound_up(const uint8_t* p, const uint8_t* w) {
-    return w && !w[0x29c] && is_axe_weapon(w) && w[0x269] && w[0x2a5] && !w[0x2a6] && w[0x28c];
+    return w && !w[0x29c] && is_axe_weapon(w) && w[0x269] && w[0x2a5] && !w[0x2a6];   // charged or not (level 2 can't charge)
 }
 static void __fastcall det_playerDraw(void* self, void* edx, void* target) {
     g_playerDrawTramp(self, edx, target);
@@ -5404,6 +5557,151 @@ __declspec(naked) static void det_chargeBonus() {
         jmp    dword ptr [g_chargeBonusResume]
     }
 }
+// ---- Momentum icon on the HUD ----
+// While your Momentum streak lasts, the HUD shows the Speedy rabbit with your other statuses. It's only
+// drawn: PlayerMenu::drawHud draws each StatusEffect in the player's list (Unit+0x23c) with
+// StatusEffect::drawIconAt, and for that loop the list is swapped for a copy with one more entry, a Speedy
+// that was built but never started (so no speed). Nothing is added to the player, so nothing reaches other
+// games (a real status is copied to them as a working one). The streak lives in the game that decides hits:
+// your own in single player, the server's on an MP host (the same slot in its player list). A client doesn't
+// know its streak, so it shows no icon.
+static const int STATUS_SPEEDY = 4;
+struct MomIcon { const void* player; uint8_t* eff; };   // a stand-in Speedy per player it was built with
+static MomIcon g_momIcons[4];
+static uint8_t* g_momHudPlayer = nullptr;
+static void* g_momHudSaved[3];
+static void* g_momHudList[65];
+static int momentum_stacks_of(const uint8_t* p) {
+    for (auto& m : g_momentum) if (m.player == p) return m.stacks;
+    return 0;
+}
+static int momentum_hud_stacks(const uint8_t* p) {
+    int st = momentum_stacks_of(p);
+    void* srv = g_lastServer;
+    if (st || !g_ge || !srv || GetTickCount() - g_lastServerStep > 500) return st;
+    uint8_t* g = reinterpret_cast<uint8_t*>(g_ge);
+    uint8_t* sg = static_cast<uint8_t*>(srv) + OFF_SERVER_GE;
+    uint8_t* pb = *reinterpret_cast<uint8_t**>(g + OFF_GE_PLAYERS_BEGIN);
+    uint8_t* pe = *reinterpret_cast<uint8_t**>(g + OFF_GE_PLAYERS_BEGIN + 4);
+    uint8_t* sb = *reinterpret_cast<uint8_t**>(sg + OFF_GE_PLAYERS_BEGIN);
+    uint8_t* se = *reinterpret_cast<uint8_t**>(sg + OFF_GE_PLAYERS_BEGIN + 4);
+    for (int i = 0; pb && pe && pb + i * PLAYER_VEC_STRIDE < pe; ++i)
+        if (*reinterpret_cast<uint8_t**>(pb + i * PLAYER_VEC_STRIDE) == p) {
+            if (sb && se && sb + i * PLAYER_VEC_STRIDE < se) return momentum_stacks_of(*reinterpret_cast<uint8_t**>(sb + i * PLAYER_VEC_STRIDE));
+            break;
+        }
+    return 0;
+}
+typedef bool (__thiscall *spFromWeak_t)(void* sp, const void* weak);
+typedef void* (__thiscall *statusCtor_t)(void* self, const void* sp, int type, int frames, float magnitude);
+typedef void (__thiscall *deleteObj_t)(void* self, int flags);
+static uint8_t* momentum_icon_effect(uint8_t* p) {
+    for (auto& mi : g_momIcons) if (mi.eff && mi.player == p) return mi.eff;
+    MomIcon* slot = nullptr;                                 // a free slot, or one whose player is gone
+    for (auto& mi : g_momIcons) if (!mi.eff || !is_player_any(mi.player)) { slot = &mi; break; }
+    if (!slot) slot = &g_momIcons[0];
+    if (slot->eff) { reinterpret_cast<deleteObj_t>(**reinterpret_cast<void***>(slot->eff))(slot->eff, 1); slot->eff = nullptr; }
+    if (!g_opnew) return nullptr;
+    void* sp[2] = { nullptr, nullptr };
+    if (!reinterpret_cast<spFromWeak_t>(g_base + 0x0001c7e0)(sp, p + 8) || !sp[0]) return nullptr;   // Unit's weak_this
+    uint8_t* e = static_cast<uint8_t*>(g_opnew(0x214));
+    if (e) reinterpret_cast<statusCtor_t>(g_base + 0x003bf640)(e, sp, STATUS_SPEEDY, 6000, 0.0f);
+    release_shared_block(sp[1]);
+    slot->eff = e; slot->player = p;
+    logmsg("[brutalist] momentum icon made for %p", p);
+    return e;
+}
+static void __cdecl momentum_hud_begin(uint8_t* menu) {
+    uint8_t* p = *reinterpret_cast<uint8_t**>(menu + 0x20);              // the HUD's player
+    if (!p || !is_player_entity(p) || momentum_hud_stacks(p) <= 0) return;
+    uint8_t* eff = momentum_icon_effect(p);
+    if (!eff) return;
+    // drawIconAt pulses an icon's alpha from its frames left (+0x1ec), and the stand-in is never stepped, so
+    // it's counted down here (kept above the last 2 s, where icons shake as they run out).
+    int& left = *reinterpret_cast<int*>(eff + 0x1ec);
+    if (--left < 200) left = 6000;
+    void** v = reinterpret_cast<void**>(p + 0x23c);                         // begin, end, capacity
+    void** b = static_cast<void**>(v[0]); void** e = static_cast<void**>(v[1]);
+    const int n = (b && e > b) ? (int)(e - b) : 0;
+    if (n >= 64) return;
+    for (int i = 0; i < n; ++i) g_momHudList[i] = b[i];
+    g_momHudList[n] = eff;
+    g_momHudSaved[0] = v[0]; g_momHudSaved[1] = v[1]; g_momHudSaved[2] = v[2];
+    v[0] = g_momHudList; v[1] = v[2] = g_momHudList + n + 1;
+    g_momHudPlayer = p;
+}
+static void __cdecl momentum_hud_end() {
+    if (!g_momHudPlayer) return;
+    void** v = reinterpret_cast<void**>(g_momHudPlayer + 0x23c);
+    v[0] = g_momHudSaved[0]; v[1] = g_momHudSaved[1]; v[2] = g_momHudSaved[2];
+    g_momHudPlayer = nullptr;
+}
+static uintptr_t g_hudBeginResume = 0, g_hudEndResume = 0, g_hudEndSkip = 0;
+__declspec(naked) static void det_hudStatusBegin() {   // PlayerMenu::drawHud 0x30eb71, edi = the menu
+    __asm {
+        pushad
+        push edi
+        call momentum_hud_begin
+        add  esp, 4
+        popad
+        mov  edx, dword ptr [edi+0x20]                 // replaced: mov edx,[edi+0x20]; mov ecx,edx
+        mov  ecx, edx
+        jmp  dword ptr [g_hudBeginResume]
+    }
+}
+__declspec(naked) static void det_hudStatusEnd() {     // 0x30ec91, where the loop (and its skips) end
+    __asm {
+        pushad
+        call momentum_hud_end
+        popad
+        cmp  dword ptr [edi+0x54], 0                   // replaced: cmp [edi+0x54],0; jne 0x30eda3
+        jne  skip
+        jmp  dword ptr [g_hudEndResume]
+    skip:
+        jmp  dword ptr [g_hudEndSkip]
+    }
+}
+// Axe level 1 (Fatiguing Blows): +25% to the hit, after the roll (which already has your stats' bonus,
+// Weapon +0x270) and any charge bonus. Replaces `mulss xmm2,[edi+0x360]` (totalDamageFactor) at 0x3fa7f7.
+static const float AXE_LV1_DAMAGE = 1.25f;
+static float g_axeDmgFactor = 1.0f;
+static uintptr_t g_axeDmgResume = 0;
+static void __cdecl axe_damage_factor(const uint8_t* weapon) {
+    float f = *reinterpret_cast<const float*>(weapon + 0x360);
+    const uint8_t* p = *reinterpret_cast<uint8_t* const*>(weapon + OFF_WEAPON_PARENT);
+    if (is_axe_weapon(weapon) && is_player_any(p) && axe_tree_level(p) >= 1)
+        f *= AXE_LV1_DAMAGE;
+    g_axeDmgFactor = f;
+}
+__declspec(naked) static void det_axeDamage() {
+    __asm {
+        pushad
+        sub    esp, 128
+        movups [esp], xmm0
+        movups [esp+16], xmm1
+        movups [esp+32], xmm2
+        movups [esp+48], xmm3
+        movups [esp+64], xmm4
+        movups [esp+80], xmm5
+        movups [esp+96], xmm6
+        movups [esp+112], xmm7
+        push   edi
+        call   axe_damage_factor
+        add    esp, 4
+        movups xmm0, [esp]
+        movups xmm1, [esp+16]
+        movups xmm2, [esp+32]
+        movups xmm3, [esp+48]
+        movups xmm4, [esp+64]
+        movups xmm5, [esp+80]
+        movups xmm6, [esp+96]
+        movups xmm7, [esp+112]
+        add    esp, 128
+        popad
+        mulss  xmm2, dword ptr [g_axeDmgFactor]
+        jmp    dword ptr [g_axeDmgResume]
+    }
+}
 // ---- Axe throw aim tilt ----
 // While charging an axe throw, tilt the axe toward where it will go: up held alone = upright, up + left/right = 45 up, down held =
 // 45 down, neither = level. It uses the bow's Weapon::aimAngle (+0x2d0, degrees, positive = up), which
@@ -5424,6 +5722,7 @@ static void __cdecl axe_aim_tilt(uint8_t* weapon) {
         return;
     }
     if (!weapon[0x269]) { ang = 0.0f; return; }              // not swinging
+    if (clone_of(weapon)) return;                            // a Party shadow's: your recorded aim (clone_tick)
     const uint8_t* p = *reinterpret_cast<uint8_t**>(weapon + OFF_WEAPON_PARENT);
     float target = 0.0f;
     if (p) target = p[0x49c] ? ((p[0x49d] || p[0x49e]) ? AXE_AIM_TILT_DEG : AXE_AIM_UP_DEG)
@@ -5573,6 +5872,20 @@ static void install_axe_tree() {
         g_returnMaxResume   = g_base + 0x003f662a;
         axe_patch("flight: return pull",  0x003f659f, pa, sizeof(pa), 0xE9, (void*)&det_returnAccel);
         axe_patch("flight: return speed", 0x003f6622, pm, sizeof(pm), 0xE9, (void*)&det_returnMax);
+    }
+    {   // Momentum icon on the HUD: around PlayerMenu::drawHud's status-icon loop
+        const uint8_t hb[5]  = {0x8B, 0x57, 0x20, 0x8B, 0xCA};
+        const uint8_t he[10] = {0x83, 0x7F, 0x54, 0x00, 0x0F, 0x85, 0x08, 0x01, 0x00, 0x00};
+        g_hudBeginResume = g_base + 0x0030eb76;
+        g_hudEndResume   = g_base + 0x0030ec9b;
+        g_hudEndSkip     = g_base + 0x0030eda3;
+        axe_patch("hud: momentum icon (start)", 0x0030eb71, hb, sizeof(hb), 0xE9, (void*)&det_hudStatusBegin);
+        axe_patch("hud: momentum icon (end)",   0x0030ec91, he, sizeof(he), 0xE9, (void*)&det_hudStatusEnd);
+    }
+    {   // level 1's +25%: mulss xmm2,[edi+0x360] in Weapon::doCollision
+        const uint8_t pd[8] = {0xF3,0x0F,0x59,0x97,0x60,0x03,0x00,0x00};
+        g_axeDmgResume = g_base + 0x003fa7ff;
+        axe_patch("doCollision: axe level 1 damage", 0x003fa7f7, pd, sizeof(pd), 0xE9, (void*)&det_axeDamage);
     }
     {   // charge bonus in Weapon::doCollision (absolute operand, so relocated)
         uint8_t pc[8] = {0xF3,0x0F,0x59,0x0D,0,0,0,0};
