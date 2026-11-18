@@ -903,7 +903,7 @@ static bool ini_mtime(FILETIME* out) {
 //   Keys are unique across sections (the manager relies on that too), so overrides key on name only.
 static volatile DWORD g_lastServerStep = 0;   // updated every Server::step; recent => this instance is the MP host
 static void* volatile g_lastServer = nullptr;  // the Server that ran that step (its GameEngine is the authoritative one)
-static const char* const VULTRA_VERSION = "1.5.3";   // bump on any change to what syncs or how
+static const char* const VULTRA_VERSION = "1.5.5";   // bump on any change to what syncs or how
 struct CfgKV { char key[40]; char val[24]; };
 static const int CFG_MAX = 128;
 static CfgKV g_cfgSnap[CFG_MAX]; static int g_cfgSnapN = 0;   // last load_config's effective values
@@ -1440,8 +1440,8 @@ static void*   g_origGetBg = nullptr;   // trampoline to original getAvailableBa
 
 // The Woodsman's own background, the way each class has one (Mage, Rogue, Knight, Wildling, Houndmaster:
 // types 15-19, offered only to that class). It reuses BG_SYNCHRONIZED (13), a cut background: the game
-// never offers it (getAvailableBackgrounds skips 13), it has no entry in the background table, and nothing
-// in the game checks for it, so it has no effect of its own. The picker builds a card straight from the
+// never offers it (getAvailableBackgrounds skips 13) and it has no entry in the background table, so it has
+// no effect of its own. PlayerMenu::updateClassBackgrounds locks it, which is patched out at install. The picker builds a card straight from the
 // type (as it does for Wisp Curse), and Background::updateNameAndDescription is hooked to rename it.
 // Picked by a Woodsman, it starts the run with Explosion Master gloves (give_explosion_gloves).
 static const int BG_WOODSMAN = 13;
@@ -4100,20 +4100,21 @@ static void install_bomber_tree() {
 //     3 Executioner  +20% damage against enemies under 30% health.
 //     4 Party        the game's own switched-off afterimage (Player+0xb80, never set by the game): a shadow
 //                    copy trails you and repeats your attacks.
-//   Scavenger (3 levels), each level +5 max health
-//     1 Hearthside   each food eaten heals 4 more (scavenger_food_heal)
+//   Scavenger (3 levels)
+//     1 Hearthside   resting at a bonfire heals 5 more (the moment Player+0xc94 "rested here" is set)
 //     2 Lockpick     locked doors open without a key: Player::haveBossKey answers yes, and
 //                    Player::removeBossKey keeps the key you hold. Chests check the key elsewhere.
 //     3 Recycler     a weapon or armor the anvil (GOD_EQUIP) or The Deranged (GOD_CHAOS) accepts pays the
-//                    nearest Scavenger 10 gold. Host side, like the shrine itself.
+//                    nearest Scavenger 10 gold. Host side, like the shrine itself. Each food eaten
+//                    also heals 4 more (scavenger_food_heal).
 static const int AFFINITY_BRUTALIST = 28;
 static const int AFFINITY_SCAVENGER = 29;
 static const float MOMENTUM_IAS = 0.08f;
 static const int   MOMENTUM_MAX = 3;
 static const DWORD MOMENTUM_FADE_MS = 5000;
 static const DWORD SUNDER_MS = 5000;
-static const int   SCAVENGER_HP_PER_LEVEL = 5;
-static const int   SCAVENGER_FOOD_HEAL = 4;      // Hearthside: extra healing for each food eaten
+static const int   SCAVENGER_BONFIRE_HEAL = 5;   // Hearthside: extra healing when resting at a bonfire
+static const int   SCAVENGER_FOOD_HEAL = 4;      // Recycler: extra healing for each food eaten
 static const int   RECYCLE_GOLD_MIN = 1, RECYCLE_GOLD_MAX = 4;   // a gold pickup of 1-4, dropped at the shrine
 static void* g_brutalistVtbl[5];
 static void* g_scavengerVtbl[5];
@@ -4126,9 +4127,9 @@ static const char* const kBrutalistDescs[4] = {
 };
 static const char* const kScavengerNames[4] = { "Hearthside", "Lockpick", "Recycler", "" };
 static const char* const kScavengerDescs[4] = {
-    "Food heals you 4 more. +5 max health.",
-    "Locked doors open for you without a key, so your keys are never used up on them. +5 max health.",
-    "Weapons and armor given to the anvil or The Deranged give you a bit of gold. +5 max health.",
+    "Resting at a bonfire heals you 5 more.",
+    "Locked doors open for you without a key.",
+    "Weapons and armor given to the anvil or The Deranged give you a bit of gold. Food heals you 4 more.",
     "",
 };
 static void __fastcall woods_initSkillStrings(uint8_t* self, void*) {
@@ -4169,27 +4170,9 @@ static MomentumState* momentum_for(void* player) {
     *m = {}; m->player = player;
     return m;
 }
-// Runs right after Player::updateStats, which rebuilds max HP and +0x940 (attack speed) from scratch. It
+// Runs right after Player::updateStats, which rebuilds +0x940 (attack speed) from scratch. It
 // only runs when stats change, not every frame, so the per-frame part is woodsman_tick below.
 static void woodsman_stats(uint8_t* p) {
-    const int scav = tree_level(p, AFFINITY_SCAVENGER);
-    if (scav > 0) *reinterpret_cast<float*>(p + 0x110) += (float)(SCAVENGER_HP_PER_LEVEL * scav);
-    // A new Scavenger level also fills the 5 it added, the way a Vitality level does (Unit::hp +0x10c).
-    static struct { const uint8_t* player; int level; } seen[8];
-    int slot = -1;
-    for (int i = 0; i < 8 && slot < 0; ++i) if (seen[i].player == p) slot = i;
-    if (slot < 0) for (int i = 0; i < 8 && slot < 0; ++i) if (!seen[i].player || !is_player_any(seen[i].player)) {
-        slot = i; seen[i].player = p; seen[i].level = 0;
-    }
-    if (slot >= 0 && scav != seen[slot].level) {
-        if (scav > seen[slot].level) {
-            float* hp = reinterpret_cast<float*>(p + 0x10c);
-            const float mx = *reinterpret_cast<float*>(p + 0x110);
-            *hp += (float)(SCAVENGER_HP_PER_LEVEL * (scav - seen[slot].level));
-            if (*hp > mx) *hp = mx;
-        }
-        seen[slot].level = scav;
-    }
     for (auto& m : g_momentum) if (m.player == p) {                // put the Momentum bonus back on
         m.applied = MOMENTUM_IAS * m.stacks;
         *reinterpret_cast<float*>(p + 0x940) += m.applied;
@@ -5469,7 +5452,24 @@ static void brutalist_post_hurt(uint8_t* u, const uint8_t* meta, float hp0) {
 
 // -- Scavenger --
 typedef void (__fastcall *playerHeal_t)(void* self, void* edx, int amount);
-// Hearthside makes food heal 4 more. The foods that heal do it through Player::heal from fixed spots
+static void __cdecl scavenger_bonfire_rest(uint8_t* p) {
+    if (!p || p[0xa2] || tree_level(p, AFFINITY_SCAVENGER) < 1) return;
+    void** vt = *reinterpret_cast<void***>(p);
+    reinterpret_cast<playerHeal_t>(vt[0x6c / 4])(p, nullptr, SCAVENGER_BONFIRE_HEAL);   // Player::heal
+    logmsg("[scavenger] bonfire rest: +%d healing", SCAVENGER_BONFIRE_HEAL);
+}
+static void* g_bonfireRestTramp = nullptr;
+__declspec(naked) static void det_bonfireRest() {   // at `mov ecx,esi; mov byte [esi+0xc94],1` (esi = player)
+    __asm {
+        pushad
+        push esi
+        call scavenger_bonfire_rest
+        add  esp, 4
+        popad
+        jmp  dword ptr [g_bonfireRestTramp]
+    }
+}
+// Recycler (Scavenger 3) also makes food heal 4 more. The foods that heal do it through Player::heal from fixed spots
 // (Item::use for what you eat from the bag, Item::pickUp for the pork chop, eaten as it's picked up), so
 // the heal hook adds the 4 when it's called from one of them. The cooked eye and the rotten chicken only
 // give a status effect (no heal), so their addStatusEffect calls are wrapped to heal 4 after.
@@ -5478,14 +5478,14 @@ static int scavenger_food_heal(const void* player, int amount, uintptr_t ret) {
     const uintptr_t r = ret - g_base;
     const char* food = r == 0x00228a16 ? "pork chop" : r == 0x00225a78 ? "roasted chicken"
                      : r == 0x00225ec3 ? "sashimi" : r == 0x00226002 ? "cooked rat" : nullptr;
-    if (!food || amount <= 0 || tree_level(static_cast<const uint8_t*>(player), AFFINITY_SCAVENGER) < 1) return amount;
+    if (!food || amount <= 0 || tree_level(static_cast<const uint8_t*>(player), AFFINITY_SCAVENGER) < 3) return amount;
     logmsg("[scavenger] %s heals %d (+%d)", food, amount + SCAVENGER_FOOD_HEAL, SCAVENGER_FOOD_HEAL);
     return amount + SCAVENGER_FOOD_HEAL;
 }
 static uintptr_t g_foodStatusRet = 0;
 static uint8_t* g_foodStatusPlayer = nullptr;
 static void __cdecl scavenger_food_status(uint8_t* p) {
-    if (!p || tree_level(p, AFFINITY_SCAVENGER) < 1) return;
+    if (!p || tree_level(p, AFFINITY_SCAVENGER) < 3) return;
     void** vt = *reinterpret_cast<void***>(p);
     reinterpret_cast<playerHeal_t>(vt[0x6c / 4])(p, nullptr, SCAVENGER_FOOD_HEAL);   // Player::heal
     logmsg("[scavenger] food without healing (eye or rotten chicken): +%d", SCAVENGER_FOOD_HEAL);
@@ -5607,9 +5607,11 @@ static void install_woods_trees() {
     for (int i = 0; i < 5; i++) g_brutalistVtbl[i] = g_scavengerVtbl[i] = club[i - 1];
     g_brutalistVtbl[2] = g_scavengerVtbl[2] = reinterpret_cast<void*>(&woods_initSkillStrings);
     g_brutalistVtbl[3] = g_scavengerVtbl[3] = reinterpret_cast<void*>(&axe_levelUp);
+    const uint8_t rest[9]   = {0x8B, 0xCE, 0xC6, 0x86, 0x94, 0x0C, 0x00, 0x00, 0x01};   // mov ecx,esi; mov byte [esi+0xc94],1
     const uint8_t haveK[8]  = {0x6A, 0x01, 0x81, 0xC1, 0xA0, 0x04, 0x00, 0x00};         // push 1; add ecx,0x4a0
     const uint8_t remK[8]   = {0x53, 0x56, 0x8D, 0x99, 0xA0, 0x04, 0x00, 0x00};         // push ebx; push esi; lea ebx,[ecx+0x4a0]
     const uint8_t pro[5]    = {0x55, 0x8B, 0xEC, 0x6A, 0xFF};
+    g_bonfireRestTramp = install_detour(0x00100025, (void*)&det_bonfireRest, 9, rest, 9);
     g_haveKeyTramp   = reinterpret_cast<haveKey_t>(install_detour(0x003006e0, (void*)&det_haveBossKey, 8, haveK, 8));
     g_removeKeyTramp = reinterpret_cast<removeKey_t>(install_detour(0x003006f0, (void*)&det_removeBossKey, 8, remK, 8));
     g_useItemTramp   = install_detour(0x00380570, (void*)&det_shrineUseItem, 5, pro, 5);
@@ -5625,7 +5627,7 @@ static void install_woods_trees() {
     const uint8_t spNew[6] = {0x0F, 0x84, 0xDA, 0x01, 0x00, 0x00};   // je 0x7f3c8e (mov ecx,this; set parent)
     bool sp = patch_replace("party: clone weapon parent", 0x003f3aae, spOld, spNew, 6);
     logmsg("[woodsman] afterimage weapon fix %s", sp ? "applied" : "FAILED");
-    logmsg("[woodsman] brutalist/scavenger hooks: key %d/%d shrine %d",
+    logmsg("[woodsman] brutalist/scavenger hooks: bonfire %d key %d/%d shrine %d", !!g_bonfireRestTramp,
            !!g_haveKeyTramp, !!g_removeKeyTramp, !!g_useItemTramp);
 }
 
@@ -5681,6 +5683,9 @@ static void __cdecl axe_charge_apply(uint8_t* player, const uint8_t* props, uint
     const bool baton = !is_axe_props(props);   // its club swing already has a charge keyframe; keep the stock one
     int lvl = axe_tree_level(player);
     if (lvl <= 0) return;
+    if (lvl >= 2)   // (diagnostic: a run where up + attack stopped throwing)
+        logmsg("[axe] attack: level %d, up %d down %d left %d right %d, weapon %p (shadow %d), movementDisabled %d, emoting %d",
+               lvl, player[0x49c], player[0x49b], player[0x49d], player[0x49e], weapon, weapon[0x29c], player[0x7e9], player[0x320]);
     bool throwing = false;
     if (lvl >= 2) { weapon[0x2a5] = player[0x49c]; throwing = player[0x49c] != 0; }   // doDaggerThrow = up held
     if (lvl >= 3) {                                                  // throws charge too: release to throw
@@ -5706,16 +5711,29 @@ __declspec(naked) static void det_axeCharge() {   // at Player::attack 0x2d3612:
 // Player::cancelAttack (stock: pressing swap, cycle-ranged or cycle-skill mid-swing cancels it, and so do a
 // few Player::step cases). It only clears Weapon+0x269 (swinging), not chargingAttack +0x28c, so a charged
 // swing stayed frozen on its charge frame and letting go did nothing (Player::stopAttack needs +0x269).
-// While a charge is held, a button press no longer cancels it: you keep charging and letting go swings.
-// Any other cancel also lets go of the charge, so the swing finishes instead of freezing.
+// While a charged swing is held, a button press no longer cancels it: you keep charging and letting go
+// swings. Any other cancel also lets go of the charge, so the swing finishes instead of freezing. A
+// charging axe throw is the exception: every cancel cancels it, and so does pressing swap on its own
+// (det_handlePlayerInput).
 typedef void (__fastcall *cancelAttack_t)(void* self, void* edx);
 static cancelAttack_t g_cancelAttackTramp = nullptr;
 static void __fastcall det_cancelAttack(void* self, void* edx) {
     uint8_t* p = static_cast<uint8_t*>(self);
     uint8_t* w = *reinterpret_cast<uint8_t**>(p + OFF_PLAYER_CURRWEAPON);
+    uintptr_t ret = reinterpret_cast<uintptr_t>(_ReturnAddress()) - g_base;
+    const bool press = ret == 0x002d5468 || ret == 0x002d589d || ret == 0x002d5cc1;   // cycleWeapon / cycleRange / cycleSkill
+    // (Weapon::endDaggerThrow, the catch, cancels too, just after the axe comes back: that's not a throw in the hand.)
+    if (w && w[0x269] && w[0x28c] && w[0x2a5] && !w[0x2a6] && ret != 0x003f9973 && is_axe_weapon(w)) {
+        // A charging axe throw is cancelled like any stock swing: the charge and the throw flag go too, so
+        // nothing is thrown later. (A charged swing keeps its charge, below.)
+        logmsg("[axe] throw cancelled (%s +0x%x, charge %d)", press ? "button press" : "game", static_cast<unsigned>(ret),
+               w[0x28c] ? *reinterpret_cast<int*>(w + 0x294) : 0);
+        w[0x28c] = 0; w[0x2a5] = 0;
+        g_cancelAttackTramp(self, edx);
+        return;
+    }
     if (w && w[0x269] && w[0x28c]) {
-        uintptr_t ret = reinterpret_cast<uintptr_t>(_ReturnAddress()) - g_base;
-        if (ret == 0x002d5468 || ret == 0x002d589d || ret == 0x002d5cc1) {   // cycleWeapon / cycleRange / cycleSkill
+        if (press) {
             logmsg("[axe] button press kept the charge (held %d frames)", *reinterpret_cast<int*>(w + 0x294));
             return;
         }
@@ -5744,6 +5762,15 @@ static void __fastcall det_handlePlayerInput(void* self, void* edx, void* in, in
     auto isReleased = reinterpret_cast<inputAct_t>(g_base + 0x001fb490);
     if (!isHeld(in, nullptr, 8, ctrl)) return;                       // swap not held: stock handled it
     uint8_t* w = *reinterpret_cast<uint8_t**>(p + OFF_PLAYER_CURRWEAPON);
+    // Swap pressed while an axe throw is charging cancels the throw. Stock only cancels when the press
+    // actually switches an item (Player::cycleWeapon etc.), which with one weapon it doesn't.
+    auto isPressed = reinterpret_cast<inputAct_t>(g_base + 0x001fb430);
+    if (w && w[0x269] && w[0x28c] && w[0x2a5] && !w[0x2a6] && !w[0x29c] && is_axe_weapon(w) && isPressed(in, nullptr, 8, ctrl)) {
+        logmsg("[axe] throw cancelled (swap pressed, charge %d)", *reinterpret_cast<int*>(w + 0x294));
+        w[0x28c] = 0; w[0x2a5] = 0;
+        g_cancelAttackTramp(p, nullptr);
+        return;
+    }
     if (p[0x78f8] && isReleased(in, nullptr, 5, ctrl)) {             // melee was held (meleeAttack) and let go
         logmsg("[axe] melee let go while swap held: releasing (charge %d)", w ? w[0x28c] : -1);
         reinterpret_cast<playerVoid_t>(g_base + 0x002d4b60)(p, nullptr);   // Player::stopMeleeAttack
@@ -5846,15 +5873,27 @@ static const size_t OFF_WEAPON_AIM    = 0x2a7;   // our byte: bits 0-1 aim (0 st
 // on timing it flew at ankle height (measured: box centred 5.5 below the thrower's centre, under the floor
 // line) instead of chest height (release keyframe 9). So the keyframe at release is remembered here per
 // weapon and held for the whole flight (axe_aim_tilt, every Weapon::step).
-struct AxeFlightPose { const uint8_t* weapon; uint8_t keyframe; };
+// The thrower's body height at the throw (top, bottom) is kept too, for the wall test (axe_wall_point).
+struct AxeFlightPose { const uint8_t* weapon; uint8_t keyframe; float top, bottom; bool logged; bool body; float bx, by; };
 static AxeFlightPose g_axeFlightPose[16] = {};
-static void axe_remember_pose(const uint8_t* weapon, uint8_t kf) {
+static void axe_remember_pose(const uint8_t* weapon, uint8_t kf, const uint8_t* thrower = nullptr) {
     int slot = 0;
     for (int i = 0; i < 16; i++) {
         if (g_axeFlightPose[i].weapon == weapon) { slot = i; break; }
         if (!g_axeFlightPose[i].weapon) slot = i;
     }
-    g_axeFlightPose[slot] = { weapon, kf };
+    float top = -1.0f, bottom = -1.0f, bx = 0.0f, by = 0.0f;
+    if (thrower) {
+        top = *reinterpret_cast<const float*>(thrower + 0xb0);
+        bottom = top + *reinterpret_cast<const float*>(thrower + 0xc4);
+        bx = *reinterpret_cast<const float*>(thrower + 0xac) + *reinterpret_cast<const float*>(thrower + 0xc0) * 0.5f;
+        by = (top + bottom) * 0.5f;
+    }
+    g_axeFlightPose[slot] = { weapon, kf, top, bottom, false, thrower != nullptr, bx, by };
+}
+static AxeFlightPose* axe_flight_slot(const uint8_t* weapon) {
+    for (auto& f : g_axeFlightPose) if (f.weapon == weapon) return &f;
+    return nullptr;
 }
 static int axe_flight_pose(const uint8_t* weapon) {
     for (int i = 0; i < 16; i++) if (g_axeFlightPose[i].weapon == weapon) return g_axeFlightPose[i].keyframe;
@@ -5890,7 +5929,11 @@ static void __cdecl axe_latch_aim(uint8_t* weapon) {
     if (CloneSwing* c = clone_of(weapon)) {     // a Party shadow throws the way you did, not the way you aim now
         if (c->aim >= 0) {
             weapon[OFF_WEAPON_AIM] = (uint8_t)c->aim;
-            if (is_axe_weapon(weapon)) axe_remember_pose(weapon, weapon[0x27c]);
+            if (is_axe_weapon(weapon)) {   // the shadow's body (you, moved to its spot for the call) for the wall test
+                const CloneOriginSwap s = clone_origin_begin(weapon);
+                axe_remember_pose(weapon, weapon[0x27c], (s.p || g_cloneSwapNow.p) ? c->player : nullptr);
+                clone_origin_end(s);
+            }
             return;
         }
     }
@@ -5900,9 +5943,8 @@ static void __cdecl axe_latch_aim(uint8_t* weapon) {
         if (p) aim = axe_aim_from_input(p);
         // Only a full charge gets the range bonus; anything less throws at the normal distance.
         int t = *reinterpret_cast<int*>(weapon + 0x294), mx = *reinterpret_cast<int*>(weapon + 0x2ec);
-        int q = (mx > 0 && t >= mx) ? 31 : 0;
-        aim |= (uint8_t)(0x80 | (q << 2));
-        axe_remember_pose(weapon, weapon[0x27c]);
+        int q = (mx > 0 && t >= mx) ? 31 : 0;        aim |= (uint8_t)(0x80 | (q << 2));
+        axe_remember_pose(weapon, weapon[0x27c], p);
     }
     weapon[OFF_WEAPON_AIM] = aim;
 }
@@ -6019,6 +6061,82 @@ __declspec(naked) static void det_throwFlight() {
         mov   dword ptr [edi+0xb8], 0
         xorps xmm2, xmm2
         jmp   dword ptr [g_throwFlightResume]
+    }
+}
+// ---- Thrown axe wall catch ----
+// On the way out, a thrown dagger/axe bounces back home the moment the centre of its hitbox is in a solid tile
+// (Weapon::resetScriptOrigin: Level::isSolid(centre / 16)). The axe's box is much bigger than a dagger's, so
+// next to a wall it caught almost every throw. For an axe the wall test point is pulled back along its
+// flight by AXE_WALL_INSET (at most half the box along that way): it has to get that deep into the wall
+// before it catches. A straight throw also keeps the point inside the thrower's body height at the throw
+// (AXE_WALL_BODY_MARGIN in from the top and bottom): the box centre sat at head height, so in a tunnel one
+// tile high it was in the ceiling the moment it left the hand. Enemy hits still use the whole box. Replaces the centre computation (x + w*0.5,
+// y + h*0.5; xmm2 = x, xmm1 = y, still in pixels); the stock *0.0625 is done here too.
+static const float AXE_WALL_INSET = 8.0f;
+static const float AXE_WALL_BODY_MARGIN = 3.0f;
+static const float kTile = 0.0625f;
+static void __cdecl axe_wall_point(const uint8_t* w, float* out) {
+    const float x = *reinterpret_cast<const float*>(w + 0xac), y = *reinterpret_cast<const float*>(w + 0xb0);
+    const float bw = *reinterpret_cast<const float*>(w + 0xc0), bh = *reinterpret_cast<const float*>(w + 0xc4);
+    float cx = x + bw * 0.5f, cy = y + bh * 0.5f;
+    if (w[OFF_WEAPON_AIM] & 0x80) {                          // an axe throw (axe_latch_aim)
+        AxeFlightPose* f = axe_flight_slot(w);
+        const float vx = *reinterpret_cast<const float*>(w + 0xb4), vy = *reinterpret_cast<const float*>(w + 0xb8);
+        const float len = sqrtf(vx * vx + vy * vy);
+        if (len > 0.0001f) {
+            const float dx = vx / len, dy = vy / len;
+            const float half = 0.5f * (fabsf(dx) * bw + fabsf(dy) * bh);
+            const float in = AXE_WALL_INSET < half ? AXE_WALL_INSET : half;
+            cx -= dx * in; cy -= dy * in;
+            // Never behind the thrower's middle (along the flight, outbound only): just after the throw the box
+            // still covers your back, and with your back to a wall the point was in that wall.
+            if (f && f->body) {
+                const float t = (cx - f->bx) * dx + (cy - f->by) * dy;
+                if (t < 0.0f) { cx -= dx * t; cy -= dy * t; }
+            }
+        }
+        const float cy0 = cy;
+        if (f && (w[OFF_WEAPON_AIM] & 3) == 0 && f->bottom - f->top > 2.0f * AXE_WALL_BODY_MARGIN) {
+            const float lo = f->top + AXE_WALL_BODY_MARGIN, hi = f->bottom - AXE_WALL_BODY_MARGIN;
+            if (cy < lo) cy = lo; else if (cy > hi) cy = hi;
+        }
+        if (f && !f->logged) {
+            f->logged = true;
+            logmsg("[axe] wall test: box %.1f,%.1f %.1fx%.1f, thrower body y %.1f-%.1f, point %.1f,%.1f (centre y %.1f), aim %d",
+                   x, y, bw, bh, f->top, f->bottom, cx, cy, cy0, w[OFF_WEAPON_AIM] & 3);
+        }
+    }
+    out[0] = cx * kTile; out[1] = cy * kTile;
+}
+static uintptr_t g_wallPointResume = 0;
+__declspec(naked) static void det_axeWallPoint() {   // at resetScriptOrigin 0x3f6794, edi = weapon, ecx = level
+    __asm {
+        sub    esp, 8                       // out[2]
+        pushad
+        sub    esp, 96
+        movups [esp], xmm0
+        movups [esp+16], xmm3
+        movups [esp+32], xmm4
+        movups [esp+48], xmm5
+        movups [esp+64], xmm6
+        movups [esp+80], xmm7
+        lea    eax, [esp+96+32]             // out, above pushad
+        push   eax
+        push   edi
+        call   axe_wall_point
+        add    esp, 8
+        movups xmm0, [esp]
+        movups xmm3, [esp+16]
+        movups xmm4, [esp+32]
+        movups xmm5, [esp+48]
+        movups xmm6, [esp+64]
+        movups xmm7, [esp+80]
+        add    esp, 96
+        popad
+        movss  xmm2, dword ptr [esp]        // x / 16
+        movss  xmm1, dword ptr [esp+4]      // y / 16
+        add    esp, 8
+        jmp    dword ptr [g_wallPointResume]
     }
 }
 // ---- Axe return speed ----
@@ -6230,8 +6348,10 @@ static void __cdecl axe_aim_tilt(uint8_t* weapon) {
     if (clone_of(weapon)) return;                            // a Party shadow's: your recorded aim (clone_tick)
     const uint8_t* p = *reinterpret_cast<uint8_t**>(weapon + OFF_WEAPON_PARENT);
     float target = 0.0f;
-    if (p) target = p[0x49c] ? ((p[0x49d] || p[0x49e]) ? AXE_AIM_TILT_DEG : AXE_AIM_UP_DEG)
-                             : (p[0x49b] ? -AXE_AIM_TILT_DEG : 0.0f);
+    if (p) {
+        const uint8_t aim = axe_aim_from_input(p);
+        target = aim == 1 ? AXE_AIM_TILT_DEG : aim == 3 ? AXE_AIM_UP_DEG : aim == 2 ? -AXE_AIM_TILT_DEG : 0.0f;
+    }
     ang += (target - ang) * 0.4f;
     if (ang - target < 0.5f && target - ang < 0.5f) ang = target;
 }
@@ -6273,9 +6393,30 @@ __declspec(naked) static void det_aimTilt() {   // at Weapon::step 0x3f0c61, esi
 // `sprite.setRotation(keyframe degrees)` (0x3f92b7) is redirected here to add the tilt to the axe sprite
 // itself: purely visual, hitboxes don't use it. Facing left the sprite is mirrored, so the sign flips.
 // While charging: up stands the axe upright, level holds it back over the head, down drops the head low.
+// A thrown axe spins end over end while it flies (forward the way it's going), timed from when this copy
+// first saw it in the air, so every game spins it the same way whether or not its flight timer runs there.
+static const float AXE_SPIN_DEG_PER_MS = 1.44f;   // 24 degrees a frame at 60 fps
+static struct { const uint8_t* weapon; DWORD start; } g_axeSpin[16] = {};
+static float axe_spin_deg(const uint8_t* weapon) {
+    const DWORD now = GetTickCount();
+    int slot = -1, free = -1;
+    for (int i = 0; i < 16; i++) {
+        if (g_axeSpin[i].weapon == weapon) { slot = i; break; }
+        if (free < 0 && (!g_axeSpin[i].weapon || now - g_axeSpin[i].start > 10000)) free = i;
+    }
+    if (slot < 0) { slot = free >= 0 ? free : 0; g_axeSpin[slot] = { weapon, now }; }
+    const float d = (float)((now - g_axeSpin[slot].start) % 250u) * AXE_SPIN_DEG_PER_MS;   // 250 ms = one turn
+    return weapon[0x268] ? -d : d;                                                           // facingLeft spins the other way
+}
+static void axe_spin_forget(const uint8_t* weapon) {
+    for (auto& s : g_axeSpin) if (s.weapon == weapon) s.weapon = nullptr;
+}
 static uintptr_t g_setRotation = 0;
 static void __cdecl axe_sprite_tilt(const uint8_t* weapon, float* deg) {
-    if (!weapon[0x2a5] || !is_axe_weapon(weapon)) return;
+    if ((!weapon[0x2a5] && !weapon[0x2a6]) || !is_axe_weapon(weapon)) return;
+    if (weapon[0x2a6]) *deg += axe_spin_deg(weapon);                // in flight
+    else axe_spin_forget(weapon);                                   // wound up: the next flight spins from 0
+    if (!weapon[0x2a5]) return;
     float a = *reinterpret_cast<const float*>(weapon + OFF_WEAPON_AIMANGLE);
     *deg += weapon[0x268] ? -a : a;   // facingLeft (checked in screenshots: aiming up raises the axe head)
 }
@@ -6361,6 +6502,14 @@ static void install_axe_tree() {
     g_throwFlightResume = g_base + 0x003f6656;
     axe_patch("stepSwing: throw aim",        0x003f07d7, p8, sizeof(p8), 0xE9, (void*)&det_throwStart);
     axe_patch("flight: aimed outbound",      0x003f66bb, p9, sizeof(p9), 0xE9, (void*)&det_throwFlight);
+    // movss xmm1,[edi+0xc4]; movss xmm2,[edi+0xc0]; mulss xmm1,xmm7; mulss xmm2,xmm7; addss xmm1,[edi+0xb0];
+    // addss xmm2,[edi+0xac]; mulss xmm1,[1/16]; mulss xmm2,[1/16] (the last two absolute, so only 40 bytes are
+    // matched and the stub jumps past all 56)
+    const uint8_t p11[] = {0xF3,0x0F,0x10,0x8F,0xC4,0x00,0x00,0x00, 0xF3,0x0F,0x10,0x97,0xC0,0x00,0x00,0x00,
+                           0xF3,0x0F,0x59,0xCF, 0xF3,0x0F,0x59,0xD7, 0xF3,0x0F,0x58,0x8F,0xB0,0x00,0x00,0x00,
+                           0xF3,0x0F,0x58,0x97,0xAC,0x00,0x00,0x00};
+    g_wallPointResume = g_base + 0x003f67cc;
+    axe_patch("flight: axe wall point",      0x003f6794, p11, sizeof(p11), 0xE9, (void*)&det_axeWallPoint);
     // mov eax,[esi+0x31c]; movss xmm0,[0xb20604] (the 90-degree clamp; absolute, so it's relocated)
     uint8_t p10[] = {0x8B,0x86,0x1C,0x03,0x00,0x00,0xF3,0x0F,0x10,0x05,0x00,0x00,0x00,0x00};
     *reinterpret_cast<uint32_t*>(p10 + 10) = static_cast<uint32_t>(g_base + 0x00720604);
@@ -7004,6 +7153,14 @@ static bool install_hook() {
         const uint8_t un_pro[6] = {0x53, 0x8B, 0xDC, 0x83, 0xEC, 0x08};   // push ebx; mov ebx,esp; sub esp,8
         g_bgUpdateNameTramp = reinterpret_cast<bgUpdateName_t>(install_detour(0x000f9890, (void*)&det_bgUpdateName, 6, un_pro, 6));
         logmsg("[woodsman] background name hook %s", g_bgUpdateNameTramp ? "installed" : "FAILED");
+        // PlayerMenu::updateClassBackgrounds locks every BG_SYNCHRONIZED (13) entry after the list is built
+        // when PlayerMenu+0 is set (`mov byte [edx+ecx*2+1],0`, two copies). 13 is only in the list as the
+        // Woodsman's background, so the locks are taken out.
+        const uint8_t lockOld[5] = {0xC6, 0x44, 0x4A, 0x01, 0x00};
+        const uint8_t lockNew[5] = {0x0F, 0x1F, 0x44, 0x00, 0x00};   // 5-byte nop
+        const bool l1 = patch_replace("woodsman bg unlock 1", 0x0031cf36, lockOld, lockNew, 5);
+        const bool l2 = patch_replace("woodsman bg unlock 2", 0x0031d016, lockOld, lockNew, 5);
+        logmsg("[woodsman] background unlock %s", l1 && l2 ? "applied" : "FAILED");
     }
 
     // Wisp Curse force-for-everyone: replace the per-floor flag-init store in loadNextLevel.

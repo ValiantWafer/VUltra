@@ -7,7 +7,7 @@
     <Nullable>enable</Nullable>
     <ImplicitUsings>enable</ImplicitUsings>
     <AssemblyName>VUltraManager</AssemblyName>
-    <Version>1.5.3</Version>
+    <Version>1.5.5</Version>
     <RootNamespace>VUltra</RootNamespace>
     <ApplicationHighDpiMode>PerMonitorV2</ApplicationHighDpiMode>
   </PropertyGroup>
