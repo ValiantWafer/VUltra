@@ -19,7 +19,8 @@ public class ModInstaller(string gameDir)
                         bool debugWarp, int warpFloor, int loopStartFloor, int startDifficulty,
                         bool mageWandTree, bool mageRandomWand, bool mageWandZero, double harderByPct, int scalingStartsAt,
                         int spawnIncreasePct, int spawnIncreaseStartsAt, int spawnIncreaseMaxPct, int spawnSpreadPct,
-                        int spawnSpreadStartsAt, int spawnSpreadMaxPct, bool cursedBomb, bool randomMatchWeapon, bool randomNoTreeDefault, bool randomArcheryBow, bool randomHealth, bool allowMidgameSpectators, bool keepLobbyJoinable)
+                        int spawnSpreadStartsAt, int spawnSpreadMaxPct, bool cursedBomb, bool randomMatchWeapon, bool randomNoTreeDefault, bool randomArcheryBow, bool randomHealth, bool randomWoodsmanTrees, int randomTreeCount, bool allowMidgameSpectators, bool keepLobbyJoinable, bool hostSettingsSync,
+                        IReadOnlyDictionary<string, string>? extra = null)
     {
         if (IsGameRunning) throw new InvalidOperationException("Close Vagante before installing.");
         if (!File.Exists(Proxy)) throw new FileNotFoundException("openal32.dll not found in the game folder.");
@@ -27,7 +28,7 @@ public class ModInstaller(string gameDir)
         if (!File.Exists(Orig)) File.Copy(Proxy, Orig);          // one-time pristine backup
         File.Copy(Orig, Real, overwrite: true);                  // forward target = real OpenAL
         WriteEmbeddedDll(Proxy);                                  // our proxy takes the slot
-        WriteIni(pool, wispCurse, loop, forceWisp, fairyMode, fairyStack, fairyHeal, debugWarp, warpFloor, loopStartFloor, startDifficulty, mageWandTree, mageRandomWand, mageWandZero, harderByPct, scalingStartsAt, spawnIncreasePct, spawnIncreaseStartsAt, spawnIncreaseMaxPct, spawnSpreadPct, spawnSpreadStartsAt, spawnSpreadMaxPct, cursedBomb, randomMatchWeapon, randomNoTreeDefault, randomArcheryBow, randomHealth, allowMidgameSpectators, keepLobbyJoinable);
+        WriteIni(pool, wispCurse, loop, forceWisp, fairyMode, fairyStack, fairyHeal, debugWarp, warpFloor, loopStartFloor, startDifficulty, mageWandTree, mageRandomWand, mageWandZero, harderByPct, scalingStartsAt, spawnIncreasePct, spawnIncreaseStartsAt, spawnIncreaseMaxPct, spawnSpreadPct, spawnSpreadStartsAt, spawnSpreadMaxPct, cursedBomb, randomMatchWeapon, randomNoTreeDefault, randomArcheryBow, randomHealth, randomWoodsmanTrees, randomTreeCount, allowMidgameSpectators, keepLobbyJoinable, hostSettingsSync, extra);
     }
 
     public void Uninstall()
@@ -91,6 +92,12 @@ public class ModInstaller(string gameDir)
     /// <summary>Reads the F11 warp target floor ([loop] warp_floor): 0..12. Default 0.</summary>
     public int ReadWarpFloor() => ReadInt("loop", "warp_floor", 0);
 
+    /// <summary>Debug start kit ([player]): start_skill_points (any value above 0 counts as on), start_regens, start_all_spellbooks, start_weapons_*. Default off.</summary>
+    public bool ReadStartSkillPoints() => ReadInt("player", "start_skill_points", 0) > 0;
+    public bool ReadStartRegens() => ReadBool("player", "start_regens");
+    public bool ReadStartAllSpellbooks() => ReadBool("player", "start_all_spellbooks");
+    public bool ReadStartWeapons(string category) => ReadBool("player", "start_weapons_" + category);
+
     /// <summary>Reads the loop restart floor ([loop] loop_start_floor): 0..12. Default 0.</summary>
     public int ReadLoopStartFloor() => ReadInt("loop", "loop_start_floor", 0);
 
@@ -133,11 +140,20 @@ public class ModInstaller(string gameDir)
     /// <summary>Reads the random-health toggle ([player] random_health): a Random character starts with a randomized max HP (60-100). Default off.</summary>
     public bool ReadRandomHealth() => ReadInt("player", "random_health", 0) != 0;
 
+    /// <summary>Reads whether a Random character can roll the Woodsman's trees ([player] random_woodsman_trees). Default on.</summary>
+    public bool ReadRandomWoodsmanTrees() => ReadInt("player", "random_woodsman_trees", 1) != 0;
+
+    /// <summary>Reads how many skill trees a Random character rolls ([player] random_tree_count): 0-16, default 4 (stock).</summary>
+    public int ReadRandomTreeCount() => ReadInt("player", "random_tree_count", 4);
+
     /// <summary>Reads the mid-game spectator toggle ([multiplayer] allow_midgame_spectators): host keeps accepting new joiners (as spectators) after the run starts. Default off. Applied at startup.</summary>
     public bool ReadAllowMidgameSpectators() => ReadInt("multiplayer", "allow_midgame_spectators", 0) != 0;
 
     /// <summary>Reads the keep-lobby-joinable toggle ([multiplayer] keep_lobby_joinable): host keeps advertising the lobby as joinable so non-modded clients still see the JOIN button mid-run. Default off. Applied at startup.</summary>
     public bool ReadKeepLobbyJoinable() => ReadInt("multiplayer", "keep_lobby_joinable", 0) != 0;
+
+    /// <summary>Reads the host-settings-sync toggle ([multiplayer] host_settings_sync): as host, publish settings to the lobby; as client, use the host's. Default on. Live-toggleable.</summary>
+    public bool ReadHostSettingsSync() => ReadInt("multiplayer", "host_settings_sync", 1) != 0;
 
     /// <summary>Reads the mage Wand-skill-tree toggle ([mage] wand_skill_tree). Default off.</summary>
     public bool ReadMageWandTree() => ReadBool("mage", "wand_skill_tree");
@@ -218,7 +234,8 @@ public class ModInstaller(string gameDir)
                          bool debugWarp, int warpFloor, int loopStartFloor, int startDifficulty,
                          bool mageWandTree, bool mageRandomWand, bool mageWandZero, double harderByPct, int scalingStartsAt,
                          int spawnIncreasePct, int spawnIncreaseStartsAt, int spawnIncreaseMaxPct, int spawnSpreadPct,
-                         int spawnSpreadStartsAt, int spawnSpreadMaxPct, bool cursedBomb, bool randomMatchWeapon, bool randomNoTreeDefault, bool randomArcheryBow, bool randomHealth, bool allowMidgameSpectators, bool keepLobbyJoinable)
+                         int spawnSpreadStartsAt, int spawnSpreadMaxPct, bool cursedBomb, bool randomMatchWeapon, bool randomNoTreeDefault, bool randomArcheryBow, bool randomHealth, bool randomWoodsmanTrees, int randomTreeCount, bool allowMidgameSpectators, bool keepLobbyJoinable, bool hostSettingsSync,
+                         IReadOnlyDictionary<string, string>? extra = null)
     {
         // Single source of the file's structure and comments is the bundled template
         // (see IniDocs). We only stamp the current values onto it, so the descriptions and
@@ -253,11 +270,15 @@ public class ModInstaller(string gameDir)
             ["random_no_tree_default"]   = b(randomNoTreeDefault),
             ["random_archery_bow"]       = b(randomArcheryBow),
             ["random_health"]            = b(randomHealth),
+            ["random_woodsman_trees"]    = b(randomWoodsmanTrees),
+            ["random_tree_count"]        = randomTreeCount.ToString(),
             ["allow_midgame_spectators"] = b(allowMidgameSpectators),
             ["keep_lobby_joinable"]      = b(keepLobbyJoinable),
+            ["host_settings_sync"]       = b(hostSettingsSync),
         };
         foreach (var sp in Spells.All)
             values[sp.Key] = pool.TryGetValue(sp.Key, out var v) && v ? "1" : "0";
+        if (extra != null) foreach (var kv in extra) values[kv.Key] = kv.Value;
 
         File.WriteAllLines(Ini, ApplyValues(IniDocs.Template, values));
     }

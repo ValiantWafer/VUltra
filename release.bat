@@ -7,12 +7,9 @@ rem
 rem  What it does:
 rem    1. Builds the manager as a self-contained single-file win-x64 exe
 rem       (bundles .NET so end users do NOT need any runtime installed).
-rem    2. Refreshes the BUILT artifacts inside the release folder:
-rem         - VUltraManager.exe        (the freshly built manager)
-rem         - Manual-install\vultramod_proxy.dll   (current proxy DLL)
-rem         - Manual-install\vultramod.ini         (current config template)
-rem       The curated text files (README.txt, install.bat, uninstall.bat) are
-rem       left untouched - edit those by hand when the release notes change.
+rem    2. Copies the freshly built VUltraManager.exe into the release folder.
+rem       README.txt is left untouched - edit it by hand for each release.
+rem       (The manager embeds the proxy DLL, so there's no manual install.)
 rem    3. Zips the whole VUltra-v<VERSION> folder into VUltra-v<VERSION>.zip.
 rem
 rem  NOTE: this does NOT rebuild the native proxy DLL. If you changed the C++
@@ -21,13 +18,12 @@ rem  built DLL looks older than the source.
 rem ===========================================================================
 
 rem ---- bump this when you cut a new release ----
-set "VERSION=1.4"
+set "VERSION=1.5.3"
 
 set "ROOT=%~dp0"
 set "MANAGER=%ROOT%manager"
 set "DLLDIR=%ROOT%dll"
 set "RELDIR=%ROOT%_local\release\VUltra-v%VERSION%"
-set "MANUAL=%RELDIR%\Manual-install"
 set "ZIP=%ROOT%_local\release\VUltra-v%VERSION%.zip"
 
 echo.
@@ -43,18 +39,29 @@ powershell -NoProfile -Command ^
   "  Write-Host '  WARNING: dll\dllmain.cpp is newer than dll\openal32.dll.' -ForegroundColor Yellow;" ^
   "  Write-Host '           Run dll\build2.bat first if the native mod changed.' -ForegroundColor Yellow }"
 
+rem ---- refuse to ship the dev test harness ----
+rem A plain dll\build2.bat includes it when _local\harness\testharness.h exists (on a dev
+rem machine). Releases must be built with "dll\build2.bat release". The harness's script
+rem file name only appears in the dll when the harness is compiled in.
+for %%F in ("%DLLDIR%\openal32.dll" "%MANAGER%\VUltra.dll") do (
+  if exist "%%~F" findstr /m /c:"vultra_test.txt" "%%~F" >nul && (
+    echo.
+    echo  %%~F contains the test harness.
+    echo  Rebuild with "dll\build2.bat release" and copy it to manager\VUltra.dll, then rerun.
+    pause & exit /b 1
+  )
+)
+
 echo.
 echo === [1/4] Building self-contained manager exe (large, please wait) ===
 dotnet publish "%MANAGER%\VUltraManager.csproj" -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true -p:IncludeNativeLibrariesForSelfExtract=true -o "%MANAGER%\publish-sc"
 if errorlevel 1 ( echo. & echo  BUILD FAILED. & pause & exit /b 1 )
 
 echo.
-echo === [2/4] Refreshing built artifacts in release folder ===
-if not exist "%MANUAL%" mkdir "%MANUAL%"
+echo === [2/4] Copying the exe into the release folder ===
+if not exist "%RELDIR%" mkdir "%RELDIR%"
 copy /y "%MANAGER%\publish-sc\VUltraManager.exe" "%RELDIR%\VUltraManager.exe" >nul || ( echo  Could not copy exe & pause & exit /b 1 )
-copy /y "%DLLDIR%\openal32.dll"  "%MANUAL%\vultramod_proxy.dll" >nul || ( echo  Could not copy proxy dll & pause & exit /b 1 )
-copy /y "%DLLDIR%\vultramod.ini" "%MANUAL%\vultramod.ini"       >nul || ( echo  Could not copy ini & pause & exit /b 1 )
-echo   exe, proxy dll, and ini updated.
+echo   exe updated.
 
 echo.
 echo === [3/4] Checking required files are present ===
@@ -62,11 +69,6 @@ set "MISSING="
 for %%F in (
   "%RELDIR%\VUltraManager.exe"
   "%RELDIR%\README.txt"
-  "%MANUAL%\vultramod_proxy.dll"
-  "%MANUAL%\vultramod.ini"
-  "%MANUAL%\install.bat"
-  "%MANUAL%\uninstall.bat"
-  "%MANUAL%\README.txt"
 ) do (
   if not exist "%%~F" ( echo   MISSING: %%~F & set "MISSING=1" )
 )

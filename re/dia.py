@@ -5,7 +5,10 @@ import ctypes
 from ctypes import POINTER, byref, c_void_p, c_wchar_p
 from ctypes.wintypes import DWORD, ULONG
 
-MSDIA = r"C:\Program Files\dotnet\sdk\9.0.101\TestHostNetFramework\x64\msdia140.dll"
+import glob, os
+# Any installed .NET SDK ships msdia140.dll; pick the newest so SDK updates don't break this.
+_cands = sorted(glob.glob(r"C:\Program Files\dotnet\sdk\*\TestHostNetFramework\x64\msdia140.dll"))
+MSDIA = _cands[-1] if _cands else r"C:\Program Files\dotnet\sdk\9.0.316\TestHostNetFramework\x64\msdia140.dll"
 CLSID_DiaSource = GUID("{E6756135-1E65-4D17-8576-610761398C3C}")
 
 # Generate comtypes wrappers from the typelib embedded in msdia140.dll

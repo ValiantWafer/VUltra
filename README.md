@@ -25,7 +25,8 @@ You need your own copy of Vagante.
 - `manager/` - a small WinForms app (.NET 9) that installs the mod and edits the ini.
 - `re/` - the Python scripts I used to find addresses in the game. They read
   `vagante.pdb`, which isn't included.
-- `_local/` - gitignored scratch (game data, RE dumps, packaged builds).
+- `_local/` - gitignored, not part of this repo: my dev tools and tests, game data,
+  and packaged builds. The build works without it.
 
 ## Build
 
