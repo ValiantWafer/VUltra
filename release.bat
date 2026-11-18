@@ -18,7 +18,7 @@ rem  built DLL looks older than the source.
 rem ===========================================================================
 
 rem ---- bump this when you cut a new release ----
-set "VERSION=1.5.3"
+set "VERSION=1.5.5"
 
 set "ROOT=%~dp0"
 set "MANAGER=%ROOT%manager"

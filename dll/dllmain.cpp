@@ -903,7 +903,7 @@ static bool ini_mtime(FILETIME* out) {
 //   Keys are unique across sections (the manager relies on that too), so overrides key on name only.
 static volatile DWORD g_lastServerStep = 0;   // updated every Server::step; recent => this instance is the MP host
 static void* volatile g_lastServer = nullptr;  // the Server that ran that step (its GameEngine is the authoritative one)
-static const char* const VULTRA_VERSION = "1.5.3";   // bump on any change to what syncs or how
+static const char* const VULTRA_VERSION = "1.5.5";   // bump on any change to what syncs or how
 struct CfgKV { char key[40]; char val[24]; };
 static const int CFG_MAX = 128;
 static CfgKV g_cfgSnap[CFG_MAX]; static int g_cfgSnapN = 0;   // last load_config's effective values
