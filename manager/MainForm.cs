@@ -42,6 +42,7 @@ public class MainForm : Form
     CheckBox _debugCheck = null!;       // dev tools: enables F11 warp + reveals the target dropdown
     Label _warpLabel = null!;
     ComboBox _warpCombo = null!;        // F11 warp target floor (0..12)
+    Action _layoutDebug = () => { };    // shows the warp row only while Debug is on, and moves the start kit up into it
     ComboBox _loopStartCombo = null!;   // where the loop restarts (0..12), separate from F11
     NumericUpDown _harderByNum = null!;     // extra monster HP/damage % per tier (float)
     NumericUpDown _scalingStartsNum = null!;// difficulty tier the extra scaling begins at
@@ -533,7 +534,7 @@ public class MainForm : Form
             Tip(_warpCombo, warpTip);
             body.Controls.Add(_warpCombo);
 
-            _debugCheck.CheckedChanged += (_, _) => { _warpLabel.Visible = _debugCheck.Checked; _warpCombo.Visible = _debugCheck.Checked; };
+            _debugCheck.CheckedChanged += (_, _) => _layoutDebug();
 
             // Start kit for testing: applies to each new character. Labels are set here (the ini key
             // start_skill_points is a number; the checkbox writes 20 or 0).
@@ -562,6 +563,17 @@ public class MainForm : Form
                 body.Controls.Add(cb);
                 _weaponKitChecks[cat] = cb;
             }
+
+            // The kit is laid out below the warp row. While that row is hidden, move it up by the row's height.
+            var kit = new List<(Control c, int y)>();
+            foreach (Control c in body.Controls)
+                if (c != _debugCheck && c != _warpLabel && c != _warpCombo) kit.Add((c, c.Top));
+            _layoutDebug = () => {
+                bool on = _debugCheck.Checked;
+                _warpLabel.Visible = _warpCombo.Visible = on;
+                foreach (var (c, y) in kit) c.Top = on ? y : y - (rowH + 8);   // then one plain row under Debug
+            };
+            _layoutDebug();
         }
 
         root.Controls.Add(flow, 0, 1);
@@ -629,7 +641,7 @@ public class MainForm : Form
         _startBooksCheck.Checked = IniDocs.BoolValue("start_all_spellbooks");
         foreach (var (cat, cb) in _weaponKitChecks) cb.Checked = IniDocs.BoolValue("start_weapons_" + cat);
         _warpCombo.SelectedIndex = Math.Clamp(IniDocs.IntValue("warp_floor", 0), 0, _warpCombo.Items.Count - 1);
-        _warpLabel.Visible = _warpCombo.Visible = _debugCheck.Checked;
+        _layoutDebug();
         _loading = false;
         UpdateDirty();
         SetStatus("Reset to defaults. Click Update Settings / Install to apply.", Muted);
@@ -726,7 +738,7 @@ public class MainForm : Form
         _startBooksCheck.Checked = _inst.ReadStartAllSpellbooks();
         foreach (var (cat, cb) in _weaponKitChecks) cb.Checked = _inst.ReadStartWeapons(cat);
         _warpCombo.SelectedIndex = Math.Clamp(_inst.ReadWarpFloor(), 0, _warpCombo.Items.Count - 1);
-        _warpLabel.Visible = _warpCombo.Visible = _debugCheck.Checked;
+        _layoutDebug();
         RefreshButtons();
         SetStatus(_inst.IsInstalled ? "Mod is installed. Toggle spells, then click 'Updates Settings'."
                                     : "Mod not installed yet. Pick your spells and click Install / Update.",

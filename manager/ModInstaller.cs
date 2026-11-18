@@ -140,8 +140,8 @@ public class ModInstaller(string gameDir)
     /// <summary>Reads the random-health toggle ([player] random_health): a Random character starts with a randomized max HP (60-100). Default off.</summary>
     public bool ReadRandomHealth() => ReadInt("player", "random_health", 0) != 0;
 
-    /// <summary>Reads whether a Random character can roll the Woodsman's trees ([player] random_woodsman_trees). Default off.</summary>
-    public bool ReadRandomWoodsmanTrees() => ReadInt("player", "random_woodsman_trees", 0) != 0;
+    /// <summary>Reads whether a Random character can roll the Woodsman's trees ([player] random_woodsman_trees). Default on.</summary>
+    public bool ReadRandomWoodsmanTrees() => ReadInt("player", "random_woodsman_trees", 1) != 0;
 
     /// <summary>Reads how many skill trees a Random character rolls ([player] random_tree_count): 0-16, default 4 (stock).</summary>
     public int ReadRandomTreeCount() => ReadInt("player", "random_tree_count", 4);

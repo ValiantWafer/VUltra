@@ -396,7 +396,7 @@ static const struct WeaponKit { const char* key; const char* name; int types[10]
     { "start_weapons_special", "special",        { 89, 90, 83, 96 } },                     // blink dagger, Thunder God hammer, spear, arm cannon
 };
 static const int N_WEAPON_KIT = sizeof(WEAPON_KIT) / sizeof(WEAPON_KIT[0]);
-static volatile bool g_randWoodsmanTrees = false; // [player] random_woodsman_trees: Random chars can roll the Woodsman's trees
+static volatile bool g_randWoodsmanTrees = true;  // [player] random_woodsman_trees: Random chars can roll the Woodsman's trees
 static const int ITEMTYPE_AXE_BROWN = 64;        // ITEMTYPE_AXE (the low-tier axe; AXE2 = 65 is the upgrade)
 // [player] random_tree_count: how many skill trees (affinities) a Random character rolls. Stock is a
 // hardcoded 4 in PlayerMenu::randomizeAffinities (it shuffles a 16-entry pool of distinct affinity
@@ -773,19 +773,41 @@ static void set_mage_affinity(bool wand) {
     FlushInstructionCache(GetCurrentProcess(), r, 0x1c);
 }
 
-// (3) Zero starting charges. The mage's weapon is filled to full at 0x30b467 via
-// `mov al,[edi+0x52d](maxWandCharges)`. Swap the source to `mov al,0` so the fill writes 0 (flag-safe:
-// the following jne reads earlier flags, so we never use a flag-affecting op). Idempotent + reversible.
+// (3) Zero starting charges, for wands only. The mage's weapon is filled to full at 0x30b467 via
+// `mov al,[edi+0x52d](maxWandCharges)` (edi = the item). Swapped for a call to mage_fill_charges, which gives
+// a wand (ITEMTYPE 68-76) 0 and anything else (the Rod) its usual full charges. Flags are kept (the jne after
+// it reads the cmp before it). Idempotent + reversible.
+__declspec(naked) static void mage_fill_charges() {
+    __asm {
+        pushfd
+        push ecx
+        mov  ecx, dword ptr [edi + 0x20c]   // Item::itemType
+        mov  al, byte ptr [edi + 0x52d]     // maxWandCharges
+        cmp  ecx, 67
+        jle  done
+        cmp  ecx, 77
+        jge  done
+        mov  al, 0                          // a wand: starts empty
+    done:
+        pop  ecx
+        popfd
+        ret
+    }
+}
 static void set_mage_wand_zero(bool zero) {
     uint8_t* p = reinterpret_cast<uint8_t*>(g_base + 0x0030b467);
     bool isFill = (p[0]==0x8A && p[1]==0x87 && p[2]==0x2D);          // mov al,[edi+0x52d]
-    bool isZero = (p[0]==0xB0 && p[1]==0x00);                        // mov al,0
-    if (!isFill && !isZero) return;                                 // unrecognized -> never touch
-    if (isZero == zero) return;                                     // already in target state
+    bool isOld  = (p[0]==0xB0 && p[1]==0x00);                        // mov al,0 (older builds' patch)
+    bool isCall = (p[0]==0xE8 && p[5]==0x90);                        // call mage_fill_charges
+    if (!isFill && !isOld && !isCall) return;                       // unrecognized -> never touch
+    if (isCall == zero && !isOld) return;                           // already in target state
     DWORD o;
     if (!VirtualProtect(p, 6, PAGE_EXECUTE_READWRITE, &o)) return;
-    if (zero) { const uint8_t n[]={0xB0,0x00,0x90,0x90,0x90,0x90}; memcpy(p,n,6); }
-    else      { const uint8_t n[]={0x8A,0x87,0x2D,0x05,0x00,0x00}; memcpy(p,n,6); }
+    if (zero) {
+        p[0] = 0xE8;
+        *reinterpret_cast<int32_t*>(p + 1) = (int32_t)(reinterpret_cast<uintptr_t>(&mage_fill_charges) - reinterpret_cast<uintptr_t>(p + 5));
+        p[5] = 0x90;
+    } else { const uint8_t n[]={0x8A,0x87,0x2D,0x05,0x00,0x00}; memcpy(p,n,6); }
     VirtualProtect(p, 6, o, &o);
     FlushInstructionCache(GetCurrentProcess(), p, 6);
 }
@@ -881,7 +903,7 @@ static bool ini_mtime(FILETIME* out) {
 //   Keys are unique across sections (the manager relies on that too), so overrides key on name only.
 static volatile DWORD g_lastServerStep = 0;   // updated every Server::step; recent => this instance is the MP host
 static void* volatile g_lastServer = nullptr;  // the Server that ran that step (its GameEngine is the authoritative one)
-static const char* const VULTRA_VERSION = "1.5.2";   // bump on any change to what syncs or how
+static const char* const VULTRA_VERSION = "1.5.3";   // bump on any change to what syncs or how
 struct CfgKV { char key[40]; char val[24]; };
 static const int CFG_MAX = 128;
 static CfgKV g_cfgSnap[CFG_MAX]; static int g_cfgSnapN = 0;   // last load_config's effective values
@@ -1001,7 +1023,7 @@ static void load_config() {
             if (cfg_int("player", WEAPON_KIT[i].key, 0, g_iniPath) != 0) cats |= 1u << i;
         g_startWeaponCats = cats;
     }
-    g_randWoodsmanTrees = cfg_int("player", "random_woodsman_trees", 0, g_iniPath) != 0;
+    g_randWoodsmanTrees = cfg_int("player", "random_woodsman_trees", 1, g_iniPath) != 0;  // on by default
     g_randomTreeCount = (int)cfg_int("player", "random_tree_count", 4, g_iniPath);  // # skill trees a Random char rolls (stock 4)
     if (g_randomTreeCount < 0)  g_randomTreeCount = 0;
     if (g_randomTreeCount > 16) g_randomTreeCount = 16;   // candidate pool is 16 distinct affinity types
@@ -1416,12 +1438,48 @@ static opnew_t g_opnew = nullptr;
 static opdel_t g_opdel = nullptr;
 static void*   g_origGetBg = nullptr;   // trampoline to original getAvailableBackgrounds
 
+// The Woodsman's own background, the way each class has one (Mage, Rogue, Knight, Wildling, Houndmaster:
+// types 15-19, offered only to that class). It reuses BG_SYNCHRONIZED (13), a cut background: the game
+// never offers it (getAvailableBackgrounds skips 13), it has no entry in the background table, and nothing
+// in the game checks for it, so it has no effect of its own. The picker builds a card straight from the
+// type (as it does for Wisp Curse), and Background::updateNameAndDescription is hooked to rename it.
+// Picked by a Woodsman, it starts the run with Explosion Master gloves (give_explosion_gloves).
+static const int BG_WOODSMAN = 13;
+static const int ATTRIBUTE_EXPLOSION_AFFINITY = 75;   // "Explosion Master"
+static const char kWoodsmanBgName[] = "Demolitionist";
+static const char kWoodsmanBgDesc[] = "You never leave home without your favorite gloves.";
+static const char kWoodsmanBgItem[] = "+Item: Explosion Master Gloves";
+// Inserted at index 12, the middle of the picker's 5x5 grid, where every other class has its own (the
+// Knight's list is 1-11, 14, then 17 at index 12).
+static const size_t BG_CLASS_SLOT = 12;
+static void bg_vec_insert(uint8_t** v, uint8_t type, uint8_t unlocked) {   // vector<pair<BackgroundType,bool>>
+    if (!g_opnew || !g_opdel) return;
+    if (v[1] == v[2]) {                                // full: grow (the game's own operator new/delete)
+        const size_t n = v[0] ? (size_t)(v[1] - v[0]) : 0;
+        const size_t cap = n ? n * 2 : 16;
+        uint8_t* nb = static_cast<uint8_t*>(g_opnew(cap));
+        if (!nb) return;
+        if (n) memcpy(nb, v[0], n);
+        if (v[0]) g_opdel(v[0]);
+        v[0] = nb; v[1] = nb + n; v[2] = nb + cap;
+    }
+    const size_t n = (size_t)(v[1] - v[0]) / 2;
+    uint8_t* at = v[0] + 2 * (n < BG_CLASS_SLOT ? n : BG_CLASS_SLOT);
+    memmove(at + 2, at, (size_t)(v[1] - at));
+    at[0] = type; at[1] = unlocked; v[1] += 2;
+}
 // In the returned vector<pair<BackgroundType,bool>> (2-byte elems), overwrite the sacrifice
-// background's type with BG_WISPCURSE (reuse its slot). TEST: tells us if the card converts.
-static void __cdecl append_wisp(void* vp) {
+// background's type with BG_WISPCURSE (reuse its slot). For the Woodsman, add its own background.
+static void __cdecl append_wisp(void* vp, int cls) {
     reload_if_ini_changed();   // pick up live toggles from the manager while at the menu
-    if (!g_wispCurse || !vp) return;
+    if (!vp) return;
     uint8_t** v = reinterpret_cast<uint8_t**>(vp);     // v[0]=first, v[1]=last, v[2]=end
+    if (cls == CLASS_WOODSMAN) {
+        bool have = false;
+        for (uint8_t* p = v[0]; p && p + 2 <= v[1]; p += 2) if (p[0] == BG_WOODSMAN) have = true;
+        if (!have) bg_vec_insert(v, (uint8_t)BG_WOODSMAN, 1);
+    }
+    if (!g_wispCurse) return;
     uint8_t* first = v[0], *last = v[1];
     if (!first) return;
     for (uint8_t* p = first; p + 2 <= last; p += 2) {
@@ -1438,20 +1496,52 @@ __declspec(naked) static void det_getBg() {
     __asm {
         push ebp
         mov  ebp, esp
-        sub  esp, 4
+        sub  esp, 8
         mov  [ebp-4], ecx           // save return-vector ptr
+        mov  [ebp-8], edx           // save the class
         push dword ptr [ebp+8]      // forward bool arg
         mov  ecx, [ebp-4]           // ecx = ret ptr  (edx still = class int)
         mov  eax, g_origGetBg
         call eax                    // run original; eax = ret ptr
         add  esp, 4                 // (original does not clean the stack arg)
+        push dword ptr [ebp-8]
         push dword ptr [ebp-4]
-        call append_wisp            // append Wisp Curse
-        add  esp, 4
+        call append_wisp            // Wisp Curse, the Woodsman's background
+        add  esp, 8
         mov  eax, [ebp-4]           // return the vector ptr
         mov  esp, ebp
         pop  ebp
         ret
+    }
+}
+
+// Background::updateNameAndDescription (thiscall, no args): +0 type, +4 name, +0x1c description (std::string).
+typedef void (__fastcall *bgUpdateName_t)(void* self, void* edx);
+static bgUpdateName_t g_bgUpdateNameTramp = nullptr;
+static void __fastcall det_bgUpdateName(void* self, void* edx) {
+    g_bgUpdateNameTramp(self, edx);
+    uint8_t* b = static_cast<uint8_t*>(self);
+    if (!b || b[0] != BG_WOODSMAN) return;
+    typedef void* (__fastcall *assign_t)(void* s, void* edx, const char* p, size_t n);
+    assign_t assign = reinterpret_cast<assign_t>(g_base + 0x0000b2b0);   // std::string::assign(const char*, size_t)
+    assign(b + 0x04, nullptr, kWoodsmanBgName, strlen(kWoodsmanBgName));
+    assign(b + 0x1c, nullptr, kWoodsmanBgDesc, strlen(kWoodsmanBgDesc));
+    // The green "+Item:" line under the description, like the other class backgrounds: the function's own
+    // helper (0x4fbe90: ecx = &this, a std::string by value, ret 0x18) pushes it onto the list at +0x34.
+    __declspec(align(4)) uint8_t sbuf[0x18] = {};
+    *reinterpret_cast<uint32_t*>(sbuf + 0x14) = 15;                           // empty, inline buffer
+    assign(sbuf, nullptr, kWoodsmanBgItem, strlen(kWoodsmanBgItem));
+    void* capture = b;
+    void** cp = &capture;
+    const uintptr_t fn = g_base + 0x000fbe90;
+    __asm {
+        sub  esp, 0x18
+        mov  edi, esp
+        lea  esi, sbuf
+        mov  ecx, 6
+        rep  movsd                  // the string moves to the argument (the helper frees it)
+        mov  ecx, cp
+        call fn
     }
 }
 
@@ -2185,6 +2275,9 @@ static void __cdecl step_frame(void* client) {
     reload_if_ini_changed();   // pick up manager "Save" live (e.g. in the lobby) -> re-syncs mage options
     if (client) g_ge = reinterpret_cast<uint8_t*>(client) + OFF_CLIENT_GE;
     test_frame(client);
+#ifdef VULTRA_VANILLA_PROBE
+    return;                    // dev probe build: the base game plus the test harness only
+#endif
     flush_enemy_dups(g_ge);    // spawn any queued enemy copies into the live level (deferred, safe here)
     sunder_tick();             // Brutalist: put back enemy defense as Sunder stacks run out
     woodsman_tick();           // Brutalist: Momentum streaks and the Party afterimage
@@ -2320,6 +2413,10 @@ static serverStep_t g_serverStepTramp = nullptr;
 static void __cdecl server_step_frame(void* server) {
     g_lastServerStep = GetTickCount();            // tell the client thread a server is active (= MP host)
     g_lastServer = server;
+#ifdef VULTRA_VANILLA_PROBE
+    if (InterlockedExchange(&g_mpWarpRequest, 0) == 1) server_warp_now(server);   // the harness's warp
+    return;
+#endif
     woodsman_server_tick(server);                 // the server's Party shadows, Momentum, Sunder (this thread)
     // MP escalating-loop reset on the authoritative server GE: a fresh host run clears newGamePlus,
     // a looped run keeps it set (server_loop_now arms it). Keeps the cycle count correct on the host.
@@ -3131,7 +3228,7 @@ static void small_bomb_set_damage(const uint8_t* proj, uint8_t* spell) {
     *reinterpret_cast<int*>(spell + 0x1fc) = dmg;                                     // minDamage
     *reinterpret_cast<int*>(spell + 0x200) = dmg * (proj[0x2a1] ? 2 : 1);             // maxDamage
     spell[0x469] = 0;                                          // destructiveExplosion off (as bomb arrows)
-    logmsg("[smallbomb] explosion: damage %d, no terrain", dmg);
+    logmsg("[smallbomb] explosion: damage %d%s, no terrain", dmg, proj[0x2a1] ? " (x2 max, explosion gloves)" : "");
 }
 static uintptr_t g_killBombResume = 0;
 __declspec(naked) static void det_killBomb() {
@@ -3222,17 +3319,22 @@ __declspec(naked) static void stub_dropMakeItem() {
     }
 }
 // Item::use: `cmp eax,0x64; jne next` is "using a bomb on something" (bomb + arrows = bomb arrows).
-// A small bomb takes the not-a-bomb branch. eax = this item's type, esi = this.
-static uintptr_t g_useBombCase = 0, g_useNotBomb = 0;
+// A small bomb can't be used on anything: it leaves through the exit a bomb used on something other than
+// arrows takes (0x62448b: result "not used", the bomb stays). It used to take the not-a-bomb branch, whose
+// fall-through is the generic "used up" ending, so a small bomb put on arrows vanished and made nothing.
+// eax = this item's type, esi = this.
+static uintptr_t g_useBombCase = 0, g_useNotBomb = 0, g_useNothing = 0;
 __declspec(naked) static void det_useBomb() {
     __asm {
         cmp  eax, 0x64
         jne  notbomb
         cmp  byte ptr [esi+0x20b], 1
-        je   notbomb
+        je   nothing
         jmp  dword ptr [g_useBombCase]
     notbomb:
         jmp  dword ptr [g_useNotBomb]
+    nothing:
+        jmp  dword ptr [g_useNothing]
     }
 }
 static void install_small_bomb() {
@@ -3286,6 +3388,7 @@ static void install_small_bomb() {
     logmsg("[smallbomb] drop one off a stack: keep small %s", dm ? "installed" : "FAILED");
     g_useBombCase = g_base + 0x00225778;
     g_useNotBomb  = g_base + 0x0022591d;
+    g_useNothing  = g_base + 0x0022448b;   // "not used" exit
     const uint8_t u[] = {0x83,0xF8,0x64,0x0F,0x85,0xA5,0x01,0x00,0x00};                // cmp eax,0x64; jne +0x1a5
     jmpPatch("use: no small bomb arrows", 0x0022576f, u, sizeof(u), 0xE9, (void*)&det_useBomb);
 }
@@ -3475,7 +3578,7 @@ static void* g_axeVtbl[5];
 static affInit_t g_clubInitStrings = nullptr;
 static const char* const kAxeText[][2] = {
     { "Club", "Axe" },
-    { "Club attacks deal more damage and stun enemies more.", "Axe attacks deal 25% more damage and stun enemies more." },
+    { "Club attacks deal more damage and stun enemies more.", "Axe attacks deal 3 more damage and stun enemies more." },
     { "Shockwave", "Axe Throw" },
     { "Fully charged attacks unleash a powerful shockwave.",
       "Hold up and attack to throw your axe. Thrown axes return to their owner." },
@@ -3518,7 +3621,7 @@ static void __fastcall axe_initSkillStrings(uint8_t* self, void*) {
 static void __fastcall axe_levelUp(uint8_t* self, void*, void* /*attributes*/) {
     ++*reinterpret_cast<int*>(self + 0x24);           // perks read this level directly (see above)
 }
-// ---- The mod's own UI art (Woodsman picker icon + title, Axe tree icon) ----
+// ---- The mod's own UI art (Woodsman picker icon + title, Axe and Bomber tree icons) ----
 // Drawn by hand (_local/art/woodsman/), baked into woodsman_art.h as raw RGBA by
 // _local/scripts/make_woodsman_art_h.py. Each becomes its own sf::Texture (the game's statically linked
 // SFML: Texture(), create(w,h), update(pixels)), built the first time it's needed, on the game thread.
@@ -3532,16 +3635,16 @@ static const uintptr_t RVA_TEXTURE_CREATE = 0x00416cd0;   // sf::Texture::create
 static const uintptr_t RVA_TEXTURE_UPDATE = 0x004179a0;   // sf::Texture::update(const Uint8*)
 static const size_t OFF_SPRITE_TEXTURE = 0xfc;            // Sprite (an sf::Sprite): m_texture
 static const size_t OFF_SPRITE_FRAME   = 0x118;           // Sprite::frame (setFrame skips an unchanged frame)
-enum { MODTEX_CLASS_ICON, MODTEX_CLASS_TITLE, MODTEX_AXE_ICON, MODTEX_COUNT };
+enum { MODTEX_CLASS_ICON, MODTEX_CLASS_TITLE, MODTEX_AXE_ICON, MODTEX_BOMBER_ICON, MODTEX_COUNT };
 static __declspec(align(8)) uint8_t g_modTexMem[MODTEX_COUNT][0x40];   // sf::Texture is 0x28 bytes
 static void* g_modTex[MODTEX_COUNT];
 static bool  g_modTexTried[MODTEX_COUNT];
 static void* mod_texture(int i) {
     if (g_modTexTried[i]) return g_modTex[i];
     g_modTexTried[i] = true;
-    static const uint8_t* const px[MODTEX_COUNT] = {WOODSMAN_CLASS_ICON_RGBA, WOODSMAN_CLASS_TITLE_RGBA, AXE_TREE_ICON_RGBA};
-    static const unsigned w[MODTEX_COUNT] = {WOODSMAN_CLASS_ICON_W, WOODSMAN_CLASS_TITLE_W, AXE_TREE_ICON_W};
-    static const unsigned h[MODTEX_COUNT] = {WOODSMAN_CLASS_ICON_H, WOODSMAN_CLASS_TITLE_H, AXE_TREE_ICON_H};
+    static const uint8_t* const px[MODTEX_COUNT] = {WOODSMAN_CLASS_ICON_RGBA, WOODSMAN_CLASS_TITLE_RGBA, AXE_TREE_ICON_RGBA, BOMBER_TREE_ICON_RGBA};
+    static const unsigned w[MODTEX_COUNT] = {WOODSMAN_CLASS_ICON_W, WOODSMAN_CLASS_TITLE_W, AXE_TREE_ICON_W, BOMBER_TREE_ICON_W};
+    static const unsigned h[MODTEX_COUNT] = {WOODSMAN_CLASS_ICON_H, WOODSMAN_CLASS_TITLE_H, AXE_TREE_ICON_H, BOMBER_TREE_ICON_H};
     void* t = g_modTexMem[i];
     reinterpret_cast<texCtor_t>(g_base + RVA_TEXTURE_CTOR)(t, nullptr);
     if (!reinterpret_cast<texCreate_t>(g_base + RVA_TEXTURE_CREATE)(t, nullptr, w[i], h[i])) {
@@ -3624,7 +3727,8 @@ static void __cdecl det_setStartingAffinities(void* player, void* ctrl) {
 //   4 Contact Fuse     your bombs fly twice as far and go off when they touch an enemy; small bombs do x2
 // Built like the Axe tree: an Affinity with AffinityClub's layout and a copy of its vtable, with
 // initSkillStrings replaced (Club's runs, then every string is overwritten) and levelUp only bumping the
-// level. The perks read the level straight off the player. Icon: the Club tree's frame as a stand-in.
+// level. The perks read the level straight off the player. Icon: the game's bomb sprite at tree icon size
+// (14x14), painted teal (_local/art/woodsman/tree_icon_bomber_14x14.png).
 // "Your bombs" = the bomb projectile's instigator (Projectile+0x2a4) is that player. Kills are seen in
 // Unit::hurt (hp goes from > 0 to <= 0); a kill is a bomb kill when the damage source is the explosion
 // SpellEntity a bomb made (remembered in a small ring as each bomb goes off), the bomb Projectile itself (a
@@ -3656,7 +3760,8 @@ static uint8_t* make_bomber_affinity() {
     if (!a) return nullptr;
     reinterpret_cast<affCtor_t>(g_base + RVA_AFFINITY_CTOR)(a, nullptr, AFFINITY_BOMBER, BOMBER_MAX_LEVEL);
     *reinterpret_cast<void***>(a) = &g_bomberVtbl[1];
-    reinterpret_cast<spriteSetFrame_t>(g_base + RVA_SPRITE_SET_FRAME)(a + 0x4c, nullptr, AXE_ICON_FRAME);
+    if (void* tex = mod_texture(MODTEX_BOMBER_ICON)) sprite_show(a + 0x4c, tex, 0);   // the game's bomb, teal
+    else reinterpret_cast<spriteSetFrame_t>(g_base + RVA_SPRITE_SET_FRAME)(a + 0x4c, nullptr, AXE_ICON_FRAME);
     return a;
 }
 static int tree_level(const uint8_t* player, int type) {
@@ -3842,7 +3947,6 @@ __declspec(naked) static void unit_add_status(void* unit, int type, int frames, 
 }
 typedef int (__fastcall *unitHurt_t)(void* self, void* edx, const void* meta);
 static unitHurt_t g_unitHurtTramp = nullptr;
-static void stomp_note_hit(const uint8_t* meta);   // (Party, below)
 static const void* brutalist_pre_hurt(uint8_t* u, const uint8_t* meta, uint8_t* copy);   // Brutalist (below)
 static void brutalist_post_hurt(uint8_t* u, const uint8_t* meta, float hp0);
 static int __fastcall det_unitHurt(void* self, void* edx, const void* meta) {
@@ -3867,7 +3971,6 @@ static int __fastcall det_unitHurt(void* self, void* edx, const void* meta) {
         logmsg("[brutalist] party: shadow's %d hit %p for %d (was %d)", *reinterpret_cast<const uint8_t*>(
                static_cast<const uint8_t*>(source) + 0x50), u, *d, was);
     }
-    if (enemy) stomp_note_hit(static_cast<const uint8_t*>(useMeta));     // Party: your stomp's landing hit
     // Contact Fuse: a level 4 bomb that hits an enemy goes off, also for enemies the per-step check can't see
     // (bosses like the baby dragon aren't in the level's targetable monster list).
     if (enemy && bomb_projectile_thrower(source) && bomber_level_of(bomb_projectile_thrower(source)) >= 4) {
@@ -3889,6 +3992,9 @@ static int __fastcall det_unitHurt(void* self, void* edx, const void* meta) {
     if (bombThrower) killer = bombThrower;
     const int lvl = bomber_level_of(killer);
     if (lvl <= 0) return r;
+    // Respawned enemies (Level::respawnMonsters, Entity::isRespawned +0x1e0) drop no loot, and a bomb dropped
+    // for one vanished when picked up, so they drop no bombs either.
+    if (u[0x1e0]) { logmsg("[bomber] respawned enemy %p: no bomb drop", u); return r; }
     bool drop = false, smallBomb = true;
     if (bombThrower && lvl >= 2) { drop = true; smallBomb = (rand() % 100) >= 5; }   // 95% small, 5% regular
     else drop = (rand() % 100) < 10;                                                 // level 1: 10%
@@ -3995,7 +4101,7 @@ static void install_bomber_tree() {
 //     4 Party        the game's own switched-off afterimage (Player+0xb80, never set by the game): a shadow
 //                    copy trails you and repeats your attacks.
 //   Scavenger (3 levels), each level +5 max health
-//     1 Hearthside   resting at a bonfire heals 5 more (the moment Player+0xc94 "rested here" is set)
+//     1 Hearthside   each food eaten heals 4 more (scavenger_food_heal)
 //     2 Lockpick     locked doors open without a key: Player::haveBossKey answers yes, and
 //                    Player::removeBossKey keeps the key you hold. Chests check the key elsewhere.
 //     3 Recycler     a weapon or armor the anvil (GOD_EQUIP) or The Deranged (GOD_CHAOS) accepts pays the
@@ -4007,7 +4113,7 @@ static const int   MOMENTUM_MAX = 3;
 static const DWORD MOMENTUM_FADE_MS = 5000;
 static const DWORD SUNDER_MS = 5000;
 static const int   SCAVENGER_HP_PER_LEVEL = 5;
-static const int   SCAVENGER_BONFIRE_HEAL = 5;
+static const int   SCAVENGER_FOOD_HEAL = 4;      // Hearthside: extra healing for each food eaten
 static const int   RECYCLE_GOLD_MIN = 1, RECYCLE_GOLD_MAX = 4;   // a gold pickup of 1-4, dropped at the shrine
 static void* g_brutalistVtbl[5];
 static void* g_scavengerVtbl[5];
@@ -4020,8 +4126,8 @@ static const char* const kBrutalistDescs[4] = {
 };
 static const char* const kScavengerNames[4] = { "Hearthside", "Lockpick", "Recycler", "" };
 static const char* const kScavengerDescs[4] = {
-    "Bonfires heal you 5 more. +5 max health.",
-    "Open locked doors without a key, and keep any key you hold. +5 max health.",
+    "Food heals you 4 more. +5 max health.",
+    "Locked doors open for you without a key, so your keys are never used up on them. +5 max health.",
     "Weapons and armor given to the anvil or The Deranged give you a bit of gold. +5 max health.",
     "",
 };
@@ -4054,7 +4160,7 @@ static uint8_t* make_woods_affinity(int type) {
 }
 
 // -- Momentum: per-player streak state --
-struct MomentumState { void* player; int stacks; int misses; bool hit; bool prevSwing; DWORD lastHit; float applied; };
+struct MomentumState { void* player; int stacks; int misses; bool hit; bool prevSwing; DWORD lastHit; float applied; int synced; DWORD syncedAt; };
 static MomentumState g_momentum[8];
 static MomentumState* momentum_for(void* player) {
     for (auto& m : g_momentum) if (m.player == player) return &m;
@@ -4133,6 +4239,10 @@ struct CloneSwing { uint8_t* player; void* sp[2]; int due; int a, b, c; float f;
     // Your weapon's aim angle (+0x2d0) each frame: the game turns only the aim of the weapon you hold, from
     // your up/down keys, so the shadow's bow never aimed. Replayed on the copy at the same point.
     float h2d0[256];
+    // Your weapon's charge timer (+0x294) each frame. A rod fires on let-go only with the timer at 14+, and in
+    // the server's game a remote player's rod tops out at exactly 14, so the copy counting on its own was a frame
+    // short or not depending on timing (the shadow's rod shot came and went in co-op). It never falls behind yours.
+    int h294[256];
     // An axe's charge is switched on by Player::attack just after startSwing (axe_charge_apply), so the copy
     // made at startSwing never had it: the charge flag, its hold keyframe (+0x290) and head start (+0x294)
     // are taken from your weapon the first frame it charges and put on the copy at the same point.
@@ -4181,7 +4291,75 @@ static bool clone_spot(const uint8_t* p, float* pos, uint8_t* flip) {
 // (woodsman_tick), and the shadow is where you were as many frames ago as the game has snapshots to draw it
 // from (index 0 of afterImageFrames; a new level clears them). Sprite positions can't be used for this: a
 // flipped sprite's position is shifted by its width, so turning around moved the shadow's spot.
-struct CloneTrail { const uint8_t* p; float pos[64][2]; int head, n; };
+// Bear's Stomp / Eagle's Rise in co-op: the flags (+0x990, +0x999) are only on a player's own copy, which only
+// shows things (+0xa2), and the server's copy, where hits are decided, never gets them, so in co-op a client's
+// stomp and rise hurt nothing (also unmodded). A client's own player goes to the server in
+// Player::serializeClientSide, which sends the current spell index (+0x8a0) as a full 32 bits: bit 30 of it now
+// says "stomping or rising" (xor, so -1 for no spell survives), and the server takes it off again before
+// Player::deserializeServerSide uses the index (body_send_skill / body_recv_skill). The server's game uses it for
+// that player's body hits (own_body_hits) and its shadow's (the trail, bit 4). An unmodded host just ignores the
+// odd index for that packet (Player::setCurrSkill checks its range).
+struct BodySync { const uint8_t* p; bool on; DWORD at; };
+static BodySync g_bodySync[16];
+static bool body_synced(const uint8_t* p) {
+    for (auto& b : g_bodySync) if (b.p == p) return b.on && GetTickCount() - b.at < 1000;
+    return false;
+}
+static void body_sync_note(const uint8_t* p, bool on) {
+    BodySync* s = nullptr;
+    for (auto& b : g_bodySync) if (b.p == p) { s = &b; break; }
+    if (!s && !on) return;
+    if (!s) for (auto& b : g_bodySync) if (!b.p || GetTickCount() - b.at > 5000) { b = BodySync{ p, false, 0 }; s = &b; break; }
+    if (!s) return;
+    if (s->on != on) logmsg("[brutalist] body sync: player %p %s", p, on ? "stomping/rising" : "done");
+    s->on = on; s->at = GetTickCount();
+}
+// The player this game last sent to the server: its own (det_stopBearStomp uses it).
+static const uint8_t* volatile g_bodyOwnSent = nullptr;
+// serializeClientSide at 0x2ebc22: `push dword ptr [edi+0x8a0]` (edi = the player) becomes a call here, which
+// leaves the index on the stack in its place, with bit 30 flipped while stomping or rising.
+__declspec(naked) static void body_send_skill() {
+    __asm {
+        mov  dword ptr [g_bodyOwnSent], edi
+        mov  eax, dword ptr [edi + 0x8a0]
+        cmp  byte ptr [edi + 0x990], 0
+        jne  body
+        cmp  byte ptr [edi + 0x999], 0
+        je   done
+    body:
+        xor  eax, 0x40000000
+    done:
+        xchg eax, dword ptr [esp]          // the index where the push put it; eax = our return address
+        jmp  eax
+    }
+}
+static void __cdecl body_recv_note(const uint8_t* p, uint32_t raw) {
+    if (is_player_any(p)) body_sync_note(p, (((raw >> 30) ^ (raw >> 31)) & 1) != 0);
+}
+// deserializeServerSide at 0x2ec517: `mov eax,[ebp-0x1c]` (the index read) + `cmp eax,[edi+0x8a0]` becomes a
+// call here: note the bit, take it off, and compare as before (the je after it reads these flags).
+__declspec(naked) static void body_recv_skill() {
+    __asm {
+        mov  eax, dword ptr [ebp - 0x1c]
+        pushad
+        push eax
+        push edi
+        call body_recv_note
+        add  esp, 8
+        popad
+        mov  ecx, eax
+        shr  ecx, 1
+        xor  ecx, eax
+        and  ecx, 0x40000000               // bit 30 ^ bit 31, at bit 30
+        xor  eax, ecx
+        mov  dword ptr [ebp - 0x1c], eax
+        cmp  eax, dword ptr [edi + 0x8a0]
+        ret
+    }
+}
+// act: your Bear's Stomp (+0x990, bit 1) and Eagle's Rise (+0x999, bit 2) that frame, or (bit 4) either one as
+// synced from your own game (see above), for the shadow's body hits.
+struct CloneTrail { const uint8_t* p; float pos[64][2]; uint8_t act[64]; int head, n; };
 static thread_local CloneTrail g_trails[8];
 static void clone_trail_push(const uint8_t* p) {
     CloneTrail* t = nullptr;
@@ -4190,10 +4368,12 @@ static void clone_trail_push(const uint8_t* p) {
     if (!t) return;
     t->pos[t->head][0] = *reinterpret_cast<const float*>(p + 0xac);
     t->pos[t->head][1] = *reinterpret_cast<const float*>(p + 0xb0);
+    t->act[t->head] = (p[0x990] ? 1 : 0) | (p[0x999] ? 2 : 0);
+    if (!t->act[t->head] && !p[0xa2] && body_synced(p)) t->act[t->head] = 4;
     t->head = (t->head + 1) % 64;
     if (t->n < 64) ++t->n;
 }
-static bool clone_body(const uint8_t* p, float* pos) {
+static bool clone_body(const uint8_t* p, float* pos, uint8_t* act = nullptr) {
     uint8_t* fb = *reinterpret_cast<uint8_t* const*>(p + 0x7860);
     uint8_t* fe = *reinterpret_cast<uint8_t* const*>(p + 0x7864);
     const int frames = (fb && fe > fb) ? (int)((fe - fb) / 0x194) : 0;
@@ -4202,6 +4382,7 @@ static bool clone_body(const uint8_t* p, float* pos) {
         const int k = t.n < frames ? t.n : frames;            // k-1 frames before the newest
         const int i = ((t.head - k) % 64 + 64) % 64;
         pos[0] = t.pos[i][0]; pos[1] = t.pos[i][1];
+        if (act) *act = t.act[i];
         return true;
     }
     return false;
@@ -4287,6 +4468,10 @@ static void __cdecl clone_record(uint8_t* w, int a, int b, int c, float f) {
     slot->smallBomb = is_small_bomb(*reinterpret_cast<void**>(p + 0x76c0));    // Player::currWeaponItem
     slot->level = *reinterpret_cast<void**>(p + OFF_ENT_LEVEL2);
     slot->epoch = g_levelEpoch;
+    // Weapon +0x350 lets a weapon run its effect cues (Weapon::stepEffectCues: a rod's shot, a wand's cast). In
+    // co-op the copy constructor leaves it 0, so in the server's game the shadow's rod never fired. Where hits are
+    // decided (your weapon isn't display-only) the copy takes yours.
+    if (!w[0xa2]) static_cast<uint8_t*>(sp[0])[0x350] = w[0x350];
 }
 // Player::stopAttack lets go of your current weapon (a bow fires, a bomb is thrown) with Weapon::stopSwing,
 // and then did the same for the shadow's weapons in its clone list, which is no longer used. Note when it
@@ -4365,6 +4550,11 @@ static void holy_replay(CloneSwing& c, uint8_t* w) {
 // set of enemies its fall already hit (+0x78fc). A landing is noted and replayed from the shadow's spot 40
 // frames later: the stomp flag, the net effect toggle (+0xc99) and that set are kept out of it (an empty
 // stand-in set is swapped in), so nothing of yours changes.
+// The screen shake and the sound are NetEvents it makes only where hits are decided (not +0xa2), and a client's
+// own stomp never lands in the server's game (that copy never has the flag), so in co-op nobody got either, the
+// host included (checked in the base game: coop/vanilla_stomp_*, with the probe build). Your own landing is run
+// as a deciding copy in your own game (a display-only one), so both play at once, for you only (the flag toggle
+// +0xc99 is kept as it was).
 typedef void (__fastcall *bearStomp_t)(void* p, void* edx, int landed);
 static bearStomp_t g_stompTramp = nullptr;
 struct StompReplay { uint8_t* p; int due; };
@@ -4377,53 +4567,215 @@ static void __fastcall det_stopBearStomp(void* self, void* edx, int landed) {
     if (!g_stompReplay && (landed & 0xff) && p[0x990] && is_player_any(p) && *reinterpret_cast<int*>(p + 0xb80) > 0)
         for (auto& st : g_stomps)
             if (!st.p) { st = StompReplay{ p, g_cloneFrame + CLONE_DELAY }; logmsg("[brutalist] party: your stomp landed"); break; }
+    if (!g_stompReplay && (landed & 0xff) && p[0xa2] && p == g_bodyOwnSent) {
+        const uint8_t net = p[0xc99], a2 = p[0xa2];
+        p[0xa2] = 0;
+        g_stompTramp(self, edx, landed);
+        p[0xa2] = a2; p[0xc99] = net;
+        logmsg("[brutalist] stomp: your landing shake and sound");
+        return;
+    }
     g_stompTramp(self, edx, landed);
 }
-// The stomp's damage is your body landing on an enemy (Player::doCollision while stomping, through Unit::hurt
-// with you as source and attacker); the shockwave only pushes. The shadow has no body, so its landing hurts
-// whatever enemy is under its feet with your stomp's hit (DamageEventMeta, 0x1c bytes) at half damage.
-// Player::doCollision hurts an enemy you stomp on (vtable +0x60) with you as the source and no attacker, while
-// the stomp (+0x990) is still on.
-struct StompHit { const uint8_t* p; uint8_t meta[0x1c]; };
-static thread_local StompHit g_stompHits[4];
-static void stomp_note_hit(const uint8_t* meta) {
-    const uint8_t* inst = *reinterpret_cast<const uint8_t* const*>(meta + 0xc);     // the source: you
-    if (!inst || g_stompReplay || !is_player_any(inst) || !inst[0x990] || *reinterpret_cast<const int*>(inst + 0xb80) <= 0) return;
-    StompHit* h = nullptr;
-    for (auto& x : g_stompHits) if (x.p == inst) { h = &x; break; }
-    if (!h) for (auto& x : g_stompHits) if (!x.p || !is_player_any(x.p)) { h = &x; break; }
-    if (!h) return;
-    h->p = inst;
-    memcpy(h->meta, meta, 0x1c);
-    logmsg("[brutalist] party: your stomp hit for %d (source %p, you %p)", *reinterpret_cast<const int*>(meta),
-           *reinterpret_cast<void* const*>(meta + 0xc), inst);
+// Bear's Stomp and Eagle's Rise hurt with your body: while either is on (+0x990, +0x999), Player::doCollision
+// hurts each enemy you touch once (the set at +0x78fc, cleared when it ends) for 3 x +0x90c, rounded at random,
+// -2..+2, at least 1, with you as the source. The shadow has no body, so it does the same by hand: on the frames
+// it replays one of yours, any enemy that overlaps your box at its spot is hurt once, for half. As in the game,
+// only where hits are decided (not in a game that only shows that player, +0xa2).
+struct ShadowBodyHits { const uint8_t* p; uint8_t* hit[24]; int n; uint8_t prev; };
+static thread_local ShadowBodyHits g_bodyHits[8];
+static int body_hit_damage(const uint8_t* p) {
+    const float s = *reinterpret_cast<const float*>(p + 0x90c) * 3.0f;
+    int d = (int)s;
+    if (s - (float)d > (float)rand() / (RAND_MAX + 1.0f)) ++d;
+    d += rand() % 5 - 2;
+    return d < 1 ? 1 : d;
 }
-static void stomp_shadow_hits(uint8_t* p, const float* body) {
-    const StompHit* h = nullptr;
-    for (auto& x : g_stompHits) if (x.p == p) { h = &x; break; }
+static const char* body_act_name(uint8_t act) { return (act & 1) ? "stomp" : (act & 2) ? "rise" : "stomp/rise"; }
+// Hurts each enemy that overlaps the player's box at pos and isn't in h yet, once (for half if half).
+static void body_hit_enemies(uint8_t* p, const float* pos, uint8_t act, bool half, ShadowBodyHits* h, const char* who) {
     uint8_t* level = *reinterpret_cast<uint8_t**>(p + OFF_ENT_LEVEL2);
     uint8_t** mons = level ? *reinterpret_cast<uint8_t***>(level + 0xfd0) : nullptr;
-    if (!h || !mons) return;
-    // The shadow's feet: your box at its spot, from its middle down to a little below its feet.
+    if (p[0xa2] || !mons) return;
     const float w = *reinterpret_cast<float*>(p + 0xc0), ht = *reinterpret_cast<float*>(p + 0xc4);
-    const float bx = body[0] - 2.0f, by = body[1] + ht * 0.5f, bw = w + 4.0f, bh = ht * 0.5f + 6.0f;
+    const float bx = pos[0] - 1.0f, by = pos[1] - 1.0f, bw = w + 2.0f, bh = ht + (((act & 2) && !(act & 1)) ? 2.0f : 6.0f);
     const int faction = *reinterpret_cast<int*>(p + 0x158);
-    uint8_t meta[0x1c];
-    memcpy(meta, h->meta, 0x1c);
-    int* dmg = reinterpret_cast<int*>(meta);
-    if (*dmg > 0) *dmg = (*dmg + 1) / 2;
     uint8_t* hit[16]; int n = 0;
     for (uint8_t* it = mons[0]; it && it < mons[1] && n < 16; it += 8) {
         uint8_t* e = *reinterpret_cast<uint8_t**>(it);
         if (!e || !e[0x160] || !e[0x226] || e[0x148] || *reinterpret_cast<float*>(e + 0x10c) <= 0.0f) continue;
         if (*reinterpret_cast<int*>(e + 0x158) == faction) continue;
+        bool done = false;
+        for (int k = 0; k < h->n; k++) if (h->hit[k] == e) done = true;
+        if (done || h->n >= 24) continue;
         const float ex = *reinterpret_cast<float*>(e + 0xac), ey = *reinterpret_cast<float*>(e + 0xb0);
         const float ew = *reinterpret_cast<float*>(e + 0xc0), eh = *reinterpret_cast<float*>(e + 0xc4);
-        if (ex < bx + bw && ex + ew > bx && ey < by + bh && ey + eh > by) hit[n++] = e;
+        if (ex < bx + bw && ex + ew > bx && ey < by + bh && ey + eh > by) { hit[n++] = e; h->hit[h->n++] = e; }
     }
     for (int i = 0; i < n; i++) {        // collected first: a death can change the monster list
+        alignas(4) uint8_t meta[0x1c] = {};
+        const int full = body_hit_damage(p);
+        const int dmg = half ? (full + 1) / 2 : full;
+        *reinterpret_cast<int*>(meta) = dmg;
+        *reinterpret_cast<uint8_t**>(meta + 0xc) = p;                                      // the source: you
+        *reinterpret_cast<void**>(meta + 0x10) = *reinterpret_cast<void**>(p + 0xc);
         reinterpret_cast<unitHurt_t>(g_base + 0x003e6aa0)(hit[i], nullptr, meta);
-        logmsg("[brutalist] party: shadow stomp hit %p for %d", hit[i], *dmg);
+        logmsg("[brutalist] party: %s %s hit %p for %d (yours would be %d)", who, body_act_name(act), hit[i], dmg, full);
+    }
+}
+static void shadow_body_tick() {
+    for (auto& t : g_trails) {
+        uint8_t* p = const_cast<uint8_t*>(t.p);
+        if (!p) continue;
+        ShadowBodyHits* h = nullptr;
+        for (auto& x : g_bodyHits) if (x.p == p) { h = &x; break; }
+        float body[2]; uint8_t act = 0;
+        if (!is_player_any(p) || *reinterpret_cast<int*>(p + 0xb80) <= 0 || !clone_body(p, body, &act)) act = 0;
+        if (!act) { if (h) *h = ShadowBodyHits{}; continue; }
+        if (!h) for (auto& x : g_bodyHits) if (!x.p || !is_player_any(x.p)) { x = ShadowBodyHits{}; x.p = p; h = &x; break; }
+        if (!h) continue;
+        if (act != h->prev) {
+            h->prev = act;
+            logmsg("[brutalist] party: frame %d shadow %s at %.0f,%.0f", g_cloneFrame,
+                   (act & 1) ? "stomping" : (act & 2) ? "rising" : "stomping/rising (synced)", body[0], body[1]);
+        }
+        body_hit_enemies(p, body, act, true, h, "shadow");
+    }
+}
+// A player's own stomp / rise in the server's game, from the synced state (the game's own body hits need the
+// flags, which that copy never has). Full damage, each enemy once per stomp or rise, as the game does it.
+static thread_local ShadowBodyHits g_ownBodyHits[8];
+static void own_body_hits(uint8_t* p) {
+    ShadowBodyHits* h = nullptr;
+    for (auto& x : g_ownBodyHits) if (x.p == p) { h = &x; break; }
+    const bool on = !p[0xa2] && !p[0x990] && !p[0x999] && body_synced(p);
+    if (!on) { if (h) *h = ShadowBodyHits{}; return; }
+    if (!h) for (auto& x : g_ownBodyHits) if (!x.p || !is_player_any(x.p)) { x = ShadowBodyHits{}; x.p = p; h = &x; break; }
+    if (!h) return;
+    const float pos[2] = { *reinterpret_cast<float*>(p + 0xac), *reinterpret_cast<float*>(p + 0xb0) };
+    body_hit_enemies(p, pos, 4, false, h, "synced");
+}
+// Your spells: Player::useSkill calls one cast function per spell (thiscall, plain ret: xmm1 = strength, some
+// also xmm2, a number from the spell's data; Summon Monster takes xmm2 and the spell's data on the stack, ret 4,
+// and reads only its level, +0x71c). Each is hooked, and a cast that returns to its call in useSkill (not a Mana
+// Orb's, not a rod's) is cast again from the shadow's spot, facing the way you faced, 40 frames later, as the
+// shadow's (half damage, half healing). Summons are left as normal summons. Blink, Fire Shield and Charm aren't
+// copied (not attacks). Mana and cooldowns are spent in useSkill, so the copy costs nothing.
+struct SpellHookDef { uintptr_t rva, site; const char* name; bool summon; };
+static const SpellHookDef kSpellHooks[] = {
+    { 0x002d8860, 0x002d7f96, "Ice Bolt", false },
+    { 0x002d8e50, 0x002d7fb4, "Fireball", false },
+    { 0x002d9fe0, 0x002d7fe4, "Summon Monster", true },
+    { 0x002da4f0, 0x002d800a, "Lightning", false },
+    { 0x002daca0, 0x002d8030, "Chain Lightning", false },
+    { 0x002db660, 0x002d804e, "Spirits", false },
+    { 0x002d9480, 0x002d8074, "Magic Missile", false },
+    { 0x002e3290, 0x002d808d, "Throw Bone", false },
+    { 0x002e1300, 0x002d8397, "Shockwave", false },
+    { 0x002e17e0, 0x002d83ba, "Blue Firebolt", false },
+    { 0x002e2020, 0x002d83d5, "Heal", false },
+    { 0x002e21e0, 0x002d83f8, "Elec Lance", false },
+    { 0x002e2880, 0x002d8411, "Frost Nova", false },
+    { 0x002e2c90, 0x002d842a, "Flame Pillar", false },
+};
+static const int SPELL_HOOKS = sizeof(kSpellHooks) / sizeof(kSpellHooks[0]);
+static void* g_spellTramp[16];
+static float g_spX1 = 0, g_spX2 = 0;
+static thread_local int g_spellReplay = 0;
+static int g_spellTestCall = 0;        // the test harness casting one directly (not from useSkill)
+// skill: your current spell when you cast (Player +0x87c vector of spells, +0x8a0 the current one), which the
+// cast functions read (Ice Bolt its +0x720, Summon gets it as its argument). The replay uses it only if it's
+// still in your list, made current for the call, so a spell switched or gone in those 40 frames is still right
+// (or the copy is skipped, never read from a freed spell).
+struct SpellReplay { uint8_t* p; int idx, due; float x1, x2; uint8_t face; const uint8_t* skill; };
+static thread_local SpellReplay g_spellReplays[16];
+static const uint8_t* const* player_skills(const uint8_t* p, int* n) {
+    const uint8_t* const* b = *reinterpret_cast<const uint8_t* const* const*>(p + 0x87c);
+    const uint8_t* const* e = *reinterpret_cast<const uint8_t* const* const*>(p + 0x880);
+    *n = (b && e > b) ? (int)(e - b) : 0;
+    return b;
+}
+static const uint8_t* player_current_skill(const uint8_t* p) {
+    int n; const uint8_t* const* b = player_skills(p, &n);
+    const int cur = *reinterpret_cast<const int*>(p + 0x8a0);
+    return (cur >= 0 && cur < n) ? b[cur] : nullptr;
+}
+static void __cdecl spell_note(int i, uint8_t* p, float x1, float x2, uintptr_t ret, const uint8_t* arg) {
+    if (g_spellReplay || g_shadowActing || i < 0 || i >= SPELL_HOOKS) return;
+    if (ret - g_base != kSpellHooks[i].site && !g_spellTestCall) return;
+    if (!is_player_any(p) || *reinterpret_cast<int*>(p + 0xb80) <= 0) return;
+    for (auto& r : g_spellReplays)
+        if (!r.p) {
+            r = SpellReplay{ p, i, g_cloneFrame + CLONE_DELAY, x1, x2, p[0x225], player_current_skill(p) };
+            if (!r.skill) { r = SpellReplay{}; break; }
+            logmsg("[brutalist] party: you cast %s (strength %.2f)", kSpellHooks[i].name, kSpellHooks[i].summon ? x2 : x1);
+            break;
+        }
+}
+// One entry stub per spell: keep xmm1/xmm2, note the cast (with its return address and stack argument), go on.
+#define SPELL_STUB(i) __declspec(naked) static void det_spell##i() { \
+    __asm movss dword ptr [g_spX1], xmm1 \
+    __asm movss dword ptr [g_spX2], xmm2 \
+    __asm pushad \
+    __asm push dword ptr [esp+0x24] \
+    __asm push dword ptr [esp+0x24] \
+    __asm push dword ptr [g_spX2] \
+    __asm push dword ptr [g_spX1] \
+    __asm push ecx \
+    __asm push i \
+    __asm call spell_note \
+    __asm add esp, 0x18 \
+    __asm popad \
+    __asm movss xmm1, dword ptr [g_spX1] \
+    __asm movss xmm2, dword ptr [g_spX2] \
+    __asm jmp dword ptr [g_spellTramp + i*4] }
+SPELL_STUB(0) SPELL_STUB(1) SPELL_STUB(2) SPELL_STUB(3) SPELL_STUB(4) SPELL_STUB(5) SPELL_STUB(6)
+SPELL_STUB(7) SPELL_STUB(8) SPELL_STUB(9) SPELL_STUB(10) SPELL_STUB(11) SPELL_STUB(12) SPELL_STUB(13)
+static void (*const kSpellStubs[])() = { det_spell0, det_spell1, det_spell2, det_spell3, det_spell4, det_spell5,
+    det_spell6, det_spell7, det_spell8, det_spell9, det_spell10, det_spell11, det_spell12, det_spell13 };
+// Calls a cast function: ecx = player, xmm1, xmm2, and the stack argument if there is one (Summon cleans it).
+__declspec(naked) static void call_spell(void* fn, uint8_t* p, float x1, float x2, void* arg) {
+    __asm {
+        push ebp
+        mov  ebp, esp
+        movss xmm1, dword ptr [ebp+0x10]
+        movss xmm2, dword ptr [ebp+0x14]
+        mov  ecx, dword ptr [ebp+0x0c]
+        push dword ptr [ebp+0x18]       // ignored by all but Summon, which pops it (mov esp,ebp covers both)
+        call dword ptr [ebp+0x08]
+        mov  esp, ebp
+        pop  ebp
+        ret
+    }
+}
+static void spell_tick() {
+    for (auto& r : g_spellReplays) {
+        if (!r.p || g_cloneFrame < r.due) continue;
+        const SpellReplay c = r;
+        r = SpellReplay{};
+        uint8_t* p = c.p;
+        float body[2];
+        if (!is_player_any(p) || *reinterpret_cast<int*>(p + 0xb80) <= 0 || !clone_body(p, body)) continue;
+        const SpellHookDef& d = kSpellHooks[c.idx];
+        int n, at = -1; const uint8_t* const* sk = player_skills(p, &n);
+        for (int k = 0; k < n; k++) if (sk[k] == c.skill) at = k;
+        if (at < 0) { logmsg("[brutalist] party: shadow's %s skipped (that spell is gone)", d.name); continue; }
+        int* cur = reinterpret_cast<int*>(p + 0x8a0);
+        const int wasCur = *cur;
+        *cur = at;
+        const float x = *reinterpret_cast<float*>(p + 0xac), y = *reinterpret_cast<float*>(p + 0xb0);
+        const uint8_t face = p[0x225];
+        *reinterpret_cast<float*>(p + 0xac) = body[0]; *reinterpret_cast<float*>(p + 0xb0) = body[1];
+        p[0x225] = c.face;
+        ++g_spellReplay;
+        if (!d.summon) ++g_shadowActing;     // a summon is a normal summon (full damage)
+        call_spell(g_spellTramp[c.idx], p, c.x1, c.x2, const_cast<uint8_t*>(c.skill));
+        if (!d.summon) --g_shadowActing;
+        --g_spellReplay;
+        *reinterpret_cast<float*>(p + 0xac) = x; *reinterpret_cast<float*>(p + 0xb0) = y;
+        p[0x225] = face;
+        *cur = wasCur;
+        logmsg("[brutalist] party: frame %d shadow cast %s at %.0f,%.0f", g_cloneFrame, d.name, body[0], body[1]);
     }
 }
 static void stomp_tick() {
@@ -4445,7 +4797,6 @@ static void stomp_tick() {
         p[0x990] = 1;
         ++g_shadowActing; ++g_stompReplay;
         g_stompTramp(p, nullptr, 1);
-        stomp_shadow_hits(p, body);
         --g_stompReplay; --g_shadowActing;
         *reinterpret_cast<float*>(p + 0xac) = x; *reinterpret_cast<float*>(p + 0xb0) = y;
         p[0x990] = stomping; p[0xc99] = net;
@@ -4492,6 +4843,39 @@ __declspec(naked) static void det_spellCollision() {
         ret  4                   // doCollision is void (thiscall, one argument)
     }
 }
+// The bomb itself hitting a player (a direct hit, before it goes off): Player::hurt drops the damage
+// (bomber_spares_player), but Projectile::doCollision had already pushed the player. A Bomber 3+ bomb
+// skips players in its collision altogether, so it flies through them. Level 4's double-speed throw made
+// these hits common on allies.
+static void* g_projCollTramp = nullptr;
+static int __cdecl bomber_bomb_skips(const uint8_t* proj, void* const* other) {
+    if (!other || !*other || !proj || proj[0x1f8] != 14 || !is_player_any(*other)) return 0;
+    const void* thrower = *reinterpret_cast<void* const*>(proj + 0x2a4);     // Projectile::instigator
+    if (!thrower || !is_player_any(thrower) || tree_level(static_cast<const uint8_t*>(thrower), AFFINITY_BOMBER) < 3) return 0;
+    static const void* lastProj = nullptr; static const void* lastPlayer = nullptr;
+    if (lastProj != proj || lastPlayer != *other) {
+        lastProj = proj; lastPlayer = *other;
+        logmsg("[bomber] no friendly fire: %s bomb flies through player %p (no knockback)",
+               thrower == *other ? "own" : "ally's", *other);
+    }
+    return 1;
+}
+__declspec(naked) static void det_projCollision() {
+    __asm {
+        pushad
+        push dword ptr [esp+0x24] // other
+        push ecx                 // this (Projectile)
+        call bomber_bomb_skips
+        add  esp, 8
+        test eax, eax
+        jnz  skip
+        popad
+        jmp  dword ptr [g_projCollTramp]
+    skip:
+        popad
+        ret  4
+    }
+}
 __declspec(naked) static void det_healCircle() {
     __asm {
         mov  dword ptr [g_curSpell], ecx
@@ -4507,8 +4891,10 @@ static int shadow_heal(int amount, uintptr_t ret) {
     logmsg("[brutalist] party: shadow's healing %d (was %d)", half, amount);
     return half;
 }
+static int scavenger_food_heal(const void* player, int amount, uintptr_t ret);   // Scavenger (below)
 static void __fastcall det_playerHeal(void* self, void* edx, int amount) {
-    g_playerHealTramp(self, edx, shadow_heal(amount, reinterpret_cast<uintptr_t>(_ReturnAddress())));
+    const uintptr_t ret = reinterpret_cast<uintptr_t>(_ReturnAddress());
+    g_playerHealTramp(self, edx, scavenger_food_heal(self, shadow_heal(amount, ret), ret));
 }
 static void __fastcall det_unitHeal(void* self, void* edx, int amount) {
     g_unitHealTramp(self, edx, shadow_heal(amount, reinterpret_cast<uintptr_t>(_ReturnAddress())));
@@ -4581,8 +4967,11 @@ static void clone_tick() {
     if (epoch != s_epoch) {                       // a level loaded: stomps waiting to replay are from the old one
         s_epoch = epoch;
         for (auto& st : g_stomps) st = StompReplay{};
+        for (auto& r : g_spellReplays) r = SpellReplay{};
     }
     stomp_tick();
+    spell_tick();
+    shadow_body_tick();
     for (auto& c : g_clones) {
         if (!c.player) continue;
         uint8_t* p = c.player;
@@ -4600,6 +4989,7 @@ static void clone_tick() {
                 if (r >= 0 && r < 256) {
                     c.h224[r] = c.orig[0x224]; c.h28c[r] = c.orig[0x28c];
                     c.h2d0[r] = *reinterpret_cast<float*>(c.orig + 0x2d0); c.hn = r + 1;
+                    c.h294[r] = *reinterpret_cast<int*>(c.orig + 0x294);
                 }
                 if (!c.capSet && c.orig[0x28c]) {
                     c.capSet = true;
@@ -4649,6 +5039,8 @@ static void clone_tick() {
         if (wand) w[0x224] = 1;
         if (c.age < c.hn) {                       // your button, the same number of frames into the swing
             if (!wand) w[0x224] = c.h224[c.age];
+            int* tm = reinterpret_cast<int*>(w + 0x294);
+            if (w[0x28c] && c.h294[c.age] > *tm) *tm = c.h294[c.age];
             if (!c.h28c[c.age]) w[0x28c] = 0;
             else if (c.capSet && !c.capApplied) {   // your charge started here
                 c.capApplied = true;
@@ -4790,8 +5182,28 @@ static void install_clone() {
     g_stopSwingTramp = reinterpret_cast<weaponStopSwing_t>(install_detour(0x003f34c0, (void*)&det_stopSwing, 5, pro, 5));
     g_lastDmgTramp = install_detour(0x00303c50, (void*)&det_lastDmgFrame, 5, pro, 5);
     g_stompTramp = reinterpret_cast<bearStomp_t>(install_detour(0x00301220, (void*)&det_stopBearStomp, 5, pro, 5));
+    {
+        int ok = 0;
+        for (int i = 0; i < SPELL_HOOKS; i++) {
+            g_spellTramp[i] = install_detour(kSpellHooks[i].rva, (void*)kSpellStubs[i], 5, pro, 5);
+            if (g_spellTramp[i]) ++ok;
+        }
+        logmsg("[brutalist] party: spell hooks %d/%d", ok, SPELL_HOOKS);
+    }
+    {   // co-op stomp / rise sync (BodySync)
+        const uint8_t sendOld[6] = {0xFF, 0xB7, 0xA0, 0x08, 0x00, 0x00};
+        uint8_t sendNew[6] = {0xE8, 0, 0, 0, 0, 0x90};
+        *reinterpret_cast<int32_t*>(sendNew + 1) = (int32_t)(reinterpret_cast<uintptr_t>(&body_send_skill) - (g_base + 0x002ebc22 + 5));
+        const uint8_t recvOld[9] = {0x8B, 0x45, 0xE4, 0x3B, 0x87, 0xA0, 0x08, 0x00, 0x00};
+        uint8_t recvNew[9] = {0xE8, 0, 0, 0, 0, 0x90, 0x90, 0x90, 0x90};
+        *reinterpret_cast<int32_t*>(recvNew + 1) = (int32_t)(reinterpret_cast<uintptr_t>(&body_recv_skill) - (g_base + 0x002ec517 + 5));
+        bool sd = patch_replace("body sync: send", 0x002ebc22, sendOld, sendNew, 6);
+        bool rv = patch_replace("body sync: receive", 0x002ec517, recvOld, recvNew, 9);
+        logmsg("[brutalist] stomp/rise sync: send %d receive %d", sd, rv);
+    }
     g_spellCollTramp   = install_detour(0x0039c730, (void*)&det_spellCollision, 5, pro, 5);
     g_healCircleTramp  = install_detour(0x003ae480, (void*)&det_healCircle, 5, pro, 5);
+    g_projCollTramp    = install_detour(0x00325140, (void*)&det_projCollision, 5, pro, 5);   // Projectile::doCollision
     g_playerHealTramp  = reinterpret_cast<healFn_t>(install_detour(0x002f8e50, (void*)&det_playerHeal, 5, pro, 5));
     g_unitHealTramp    = reinterpret_cast<healFn_t>(install_detour(0x003e7cd0, (void*)&det_unitHeal, 5, pro, 5));
     logmsg("[brutalist] party: holy light hook %s, stomp hook %s, half-healing hooks %d%d%d%d", g_lastDmgTramp ? "installed" : "FAILED",
@@ -4867,14 +5279,25 @@ static void woodsman_tick_ge(uint8_t* g) {
             clone_trail_push(p);                                  // where the shadow will stand
         }
         if (!p[0xa2]) axe_unstick(p);                             // (your own player; a remote one's owner does it)
+        own_body_hits(p);                                         // co-op: a stomp / rise synced from its own game
         if (brut < 1) continue;
         MomentumState* m = momentum_for(p);
         const uint8_t* w = *reinterpret_cast<uint8_t* const*>(p + OFF_PLAYER_CURRWEAPON);
         const bool swing = w && w[0x269];
+        if (g == reinterpret_cast<uint8_t*>(g_ge) && m->syncedAt && now - m->syncedAt < 1000) {
+            // In co-op hits are only decided in the server's game, so this copy takes the server's count
+            // (momentum_state_in) instead of keeping a streak of its own that never sees a hit.
+            if (m->synced != m->stacks) logmsg("[brutalist] momentum %d (from the server) player=%p", m->synced, p);
+            m->stacks = m->synced; m->misses = 0; m->hit = false; m->prevSwing = swing; m->lastHit = now;
+            const float want = MOMENTUM_IAS * m->stacks;
+            *reinterpret_cast<float*>(p + 0x940) += want - m->applied;
+            m->applied = want;
+            continue;
+        }
         if (m->prevSwing && !swing) {                               // an attack just ended
             if (m->hit) { if (m->stacks < MOMENTUM_MAX) ++m->stacks; m->misses = 0; }
             else if (m->stacks && ++m->misses >= 2) { m->stacks = 0; m->misses = 0; }
-            logmsg("[brutalist] momentum %d (%s, misses %d)", m->stacks, m->hit ? "hit" : "miss", m->misses);
+            logmsg("[brutalist] momentum %d (%s, misses %d) player=%p", m->stacks, m->hit ? "hit" : "miss", m->misses, p);
             m->hit = false;
         }
         m->prevSwing = swing;
@@ -4889,6 +5312,70 @@ static void momentum_hit(uint8_t* player) {
     MomentumState* m = momentum_for(player);
     m->hit = true;
     m->lastHit = GetTickCount();
+}
+// Momentum in co-op: the server's copy of each player keeps the streak, and every game needs the count to
+// put the attack speed on its own copy (the one you see and swing with). It rides in the player state the
+// game already sends: EntityState::flags6 (+0x2c) bits 8-15 are the background type, which never goes past
+// 19, so its top 3 bits (0xE000) are free. Player::getEntityState packs the count there, and
+// Player::setEntityState takes it back out before the game reads the background.
+static const uint32_t MOMENTUM_STATE_MASK = 0xE000;
+static const int      MOMENTUM_STATE_SHIFT = 13;
+static void* g_playerGetStateTramp = nullptr;
+static void* g_playerSetStateTramp = nullptr;
+static void __cdecl momentum_state_out(uint8_t* player, uint8_t* st) {
+    if (!player || !st) return;
+    uint32_t& f6 = *reinterpret_cast<uint32_t*>(st + 0x2c);
+    f6 &= ~MOMENTUM_STATE_MASK;
+    int n = 0;
+    for (auto& m : g_momentum) if (m.player == player) n = m.stacks;
+    if (n < 0) n = 0;
+    if (n > 7) n = 7;
+    f6 |= (uint32_t)n << MOMENTUM_STATE_SHIFT;
+}
+static uint32_t __cdecl momentum_state_in(uint8_t* player, uint8_t* st) {
+    if (!player || !st) return 0;
+    uint32_t& f6 = *reinterpret_cast<uint32_t*>(st + 0x2c);
+    const uint32_t bits = f6 & MOMENTUM_STATE_MASK;
+    f6 &= ~MOMENTUM_STATE_MASK;                                    // the game reads a clean background type
+    if (is_player_entity(player) && tree_level(player, AFFINITY_BRUTALIST) >= 1) {   // not the server's own copies
+        MomentumState* m = momentum_for(player);
+        m->synced = (int)(bits >> MOMENTUM_STATE_SHIFT);
+        if (m->synced > MOMENTUM_MAX) m->synced = MOMENTUM_MAX;
+        m->syncedAt = GetTickCount();
+    }
+    return bits;                                                   // put back after, for the next delta
+}
+__declspec(naked) static void det_playerGetState() {                // thiscall, no args, returns the state
+    __asm {
+        push ecx
+        call dword ptr [g_playerGetStateTramp]
+        pop  ecx
+        push eax
+        push eax
+        push ecx
+        call momentum_state_out
+        add  esp, 8
+        pop  eax
+        ret
+    }
+}
+__declspec(naked) static void det_playerSetState() {                // thiscall(const EntityState*), ret 4
+    __asm {
+        push ecx
+        push dword ptr [esp+8]
+        push ecx
+        call momentum_state_in
+        add  esp, 8
+        mov  ecx, [esp]
+        push eax
+        push dword ptr [esp+0x0c]
+        call dword ptr [g_playerSetStateTramp]
+        pop  eax
+        pop  ecx
+        mov  edx, [esp+4]
+        or   dword ptr [edx+0x2c], eax
+        ret  4
+    }
 }
 
 // -- Sunder: defense taken off enemies, put back as each stack runs out --
@@ -4982,21 +5469,40 @@ static void brutalist_post_hurt(uint8_t* u, const uint8_t* meta, float hp0) {
 
 // -- Scavenger --
 typedef void (__fastcall *playerHeal_t)(void* self, void* edx, int amount);
-static void __cdecl scavenger_bonfire_rest(uint8_t* p) {
-    if (!p || p[0xa2] || tree_level(p, AFFINITY_SCAVENGER) < 1) return;
-    void** vt = *reinterpret_cast<void***>(p);
-    reinterpret_cast<playerHeal_t>(vt[0x6c / 4])(p, nullptr, SCAVENGER_BONFIRE_HEAL);   // Player::heal
-    logmsg("[scavenger] bonfire rest: +%d healing", SCAVENGER_BONFIRE_HEAL);
+// Hearthside makes food heal 4 more. The foods that heal do it through Player::heal from fixed spots
+// (Item::use for what you eat from the bag, Item::pickUp for the pork chop, eaten as it's picked up), so
+// the heal hook adds the 4 when it's called from one of them. The cooked eye and the rotten chicken only
+// give a status effect (no heal), so their addStatusEffect calls are wrapped to heal 4 after.
+// Candy (removed from the game) and potions are left out.
+static int scavenger_food_heal(const void* player, int amount, uintptr_t ret) {
+    const uintptr_t r = ret - g_base;
+    const char* food = r == 0x00228a16 ? "pork chop" : r == 0x00225a78 ? "roasted chicken"
+                     : r == 0x00225ec3 ? "sashimi" : r == 0x00226002 ? "cooked rat" : nullptr;
+    if (!food || amount <= 0 || tree_level(static_cast<const uint8_t*>(player), AFFINITY_SCAVENGER) < 1) return amount;
+    logmsg("[scavenger] %s heals %d (+%d)", food, amount + SCAVENGER_FOOD_HEAL, SCAVENGER_FOOD_HEAL);
+    return amount + SCAVENGER_FOOD_HEAL;
 }
-static void* g_bonfireRestTramp = nullptr;
-__declspec(naked) static void det_bonfireRest() {   // at `mov ecx,esi; mov byte [esi+0xc94],1` (esi = player)
+static uintptr_t g_foodStatusRet = 0;
+static uint8_t* g_foodStatusPlayer = nullptr;
+static void __cdecl scavenger_food_status(uint8_t* p) {
+    if (!p || tree_level(p, AFFINITY_SCAVENGER) < 1) return;
+    void** vt = *reinterpret_cast<void***>(p);
+    reinterpret_cast<playerHeal_t>(vt[0x6c / 4])(p, nullptr, SCAVENGER_FOOD_HEAL);   // Player::heal
+    logmsg("[scavenger] food without healing (eye or rotten chicken): +%d", SCAVENGER_FOOD_HEAL);
+}
+__declspec(naked) static void stub_foodStatus() {   // replaces `call Unit::addStatusEffect` (ecx = player, ret 0x10)
     __asm {
+        pop  dword ptr [g_foodStatusRet]
+        mov  dword ptr [g_foodStatusPlayer], ecx
+        mov  eax, g_base
+        add  eax, 0x003e7f40
+        call eax
         pushad
-        push esi
-        call scavenger_bonfire_rest
+        push dword ptr [g_foodStatusPlayer]
+        call scavenger_food_status
         add  esp, 4
         popad
-        jmp  dword ptr [g_bonfireRestTramp]
+        jmp  dword ptr [g_foodStatusRet]
     }
 }
 typedef bool (__fastcall *haveKey_t)(void* self, void* edx);
@@ -5101,14 +5607,15 @@ static void install_woods_trees() {
     for (int i = 0; i < 5; i++) g_brutalistVtbl[i] = g_scavengerVtbl[i] = club[i - 1];
     g_brutalistVtbl[2] = g_scavengerVtbl[2] = reinterpret_cast<void*>(&woods_initSkillStrings);
     g_brutalistVtbl[3] = g_scavengerVtbl[3] = reinterpret_cast<void*>(&axe_levelUp);
-    const uint8_t rest[9]   = {0x8B, 0xCE, 0xC6, 0x86, 0x94, 0x0C, 0x00, 0x00, 0x01};   // mov ecx,esi; mov byte [esi+0xc94],1
     const uint8_t haveK[8]  = {0x6A, 0x01, 0x81, 0xC1, 0xA0, 0x04, 0x00, 0x00};         // push 1; add ecx,0x4a0
     const uint8_t remK[8]   = {0x53, 0x56, 0x8D, 0x99, 0xA0, 0x04, 0x00, 0x00};         // push ebx; push esi; lea ebx,[ecx+0x4a0]
     const uint8_t pro[5]    = {0x55, 0x8B, 0xEC, 0x6A, 0xFF};
-    g_bonfireRestTramp = install_detour(0x00100025, (void*)&det_bonfireRest, 9, rest, 9);
     g_haveKeyTramp   = reinterpret_cast<haveKey_t>(install_detour(0x003006e0, (void*)&det_haveBossKey, 8, haveK, 8));
     g_removeKeyTramp = reinterpret_cast<removeKey_t>(install_detour(0x003006f0, (void*)&det_removeBossKey, 8, remK, 8));
     g_useItemTramp   = install_detour(0x00380570, (void*)&det_shrineUseItem, 5, pro, 5);
+    const bool fr = redirect_call(0x00225bf9, g_base + 0x003e7f40, (void*)&stub_foodStatus);   // rotten chicken
+    const bool fe = redirect_call(0x00225d57, g_base + 0x003e7f40, (void*)&stub_foodStatus);   // cooked eye
+    logmsg("[scavenger] food heal: rotten chicken %d, cooked eye %d", fr, fe);
     // Party: the game's afterimage attack builds its shadow weapon as a copy of yours (Weapon's copy ctor),
     // and the copy ctor calls Weapon::setParent before any shared_ptr owns the new weapon. setParent locks
     // the weapon's own weak_ptr to add it to the parent's weapon list, which throws bad_weak_ptr there and
@@ -5118,23 +5625,28 @@ static void install_woods_trees() {
     const uint8_t spNew[6] = {0x0F, 0x84, 0xDA, 0x01, 0x00, 0x00};   // je 0x7f3c8e (mov ecx,this; set parent)
     bool sp = patch_replace("party: clone weapon parent", 0x003f3aae, spOld, spNew, 6);
     logmsg("[woodsman] afterimage weapon fix %s", sp ? "applied" : "FAILED");
-    logmsg("[woodsman] brutalist/scavenger hooks: bonfire %d key %d/%d shrine %d", !!g_bonfireRestTramp,
+    logmsg("[woodsman] brutalist/scavenger hooks: key %d/%d shrine %d",
            !!g_haveKeyTramp, !!g_removeKeyTramp, !!g_useItemTramp);
 }
 
 // Player::attack, level 1 (the stun bonus). Stock: `if (isClub) { if (clubBonusStun) <apply> } else <next
 // weapon check>`. <apply> sets the weapon's stun (+0x234) to 4 and its flat bonus damage (+0x228/+0x22c,
-// added to the min/max roll in Weapon::doCollision) to 3. An axe with Axe tree >= 1 gets the same stun but no
-// flat bonus: its hits are +25% instead, in doCollision (axe_damage_factor).
+// added to the min/max roll in Weapon::doCollision) to 3. An axe with Axe tree >= 1 gets the same: stun 4
+// and +3 damage (it was +25% to the hit for a while, too strong).
+static const int AXE_LV1_BONUS = 3;   // Axe level 1: flat damage added to the min/max roll (as the Club's)
 static uintptr_t g_axeStunApply = 0, g_axeStunSkip = 0, g_axeStunNotClub = 0, g_axeStunJmp = 0;
 static uintptr_t __cdecl axe_stun_route(const uint8_t* player, const uint8_t* props) {
     if (props[0x5c] & 0x80) return player[0x9e8] ? g_axeStunApply : g_axeStunSkip;   // club, clubBonusStun
     uint8_t* w = *reinterpret_cast<uint8_t* const*>(player + OFF_PLAYER_CURRWEAPON);
     if (is_axe_weapon(w, props) && axe_tree_level(player) >= 1) {
         *reinterpret_cast<float*>(w + 0x234) = 4.0f;
+        *reinterpret_cast<int*>(w + 0x228) = AXE_LV1_BONUS;
+        *reinterpret_cast<int*>(w + 0x22c) = AXE_LV1_BONUS;
+        return g_axeStunSkip;
+    }
+    if (w && is_axe_weapon(w, props)) {             // an axe without the tree (picked up from a Woodsman): no +3
         *reinterpret_cast<int*>(w + 0x228) = 0;
         *reinterpret_cast<int*>(w + 0x22c) = 0;
-        return g_axeStunSkip;
     }
     return g_axeStunNotClub;
 }
@@ -5695,47 +6207,6 @@ __declspec(naked) static void det_hudStatusEnd() {     // 0x30ec91, where the lo
         jmp  dword ptr [g_hudEndSkip]
     }
 }
-// Axe level 1 (Fatiguing Blows): +25% to the hit, after the roll (which already has your stats' bonus,
-// Weapon +0x270) and any charge bonus. Replaces `mulss xmm2,[edi+0x360]` (totalDamageFactor) at 0x3fa7f7.
-static const float AXE_LV1_DAMAGE = 1.25f;
-static float g_axeDmgFactor = 1.0f;
-static uintptr_t g_axeDmgResume = 0;
-static void __cdecl axe_damage_factor(const uint8_t* weapon) {
-    float f = *reinterpret_cast<const float*>(weapon + 0x360);
-    const uint8_t* p = *reinterpret_cast<uint8_t* const*>(weapon + OFF_WEAPON_PARENT);
-    if (is_axe_weapon(weapon) && is_player_any(p) && axe_tree_level(p) >= 1)
-        f *= AXE_LV1_DAMAGE;
-    g_axeDmgFactor = f;
-}
-__declspec(naked) static void det_axeDamage() {
-    __asm {
-        pushad
-        sub    esp, 128
-        movups [esp], xmm0
-        movups [esp+16], xmm1
-        movups [esp+32], xmm2
-        movups [esp+48], xmm3
-        movups [esp+64], xmm4
-        movups [esp+80], xmm5
-        movups [esp+96], xmm6
-        movups [esp+112], xmm7
-        push   edi
-        call   axe_damage_factor
-        add    esp, 4
-        movups xmm0, [esp]
-        movups xmm1, [esp+16]
-        movups xmm2, [esp+32]
-        movups xmm3, [esp+48]
-        movups xmm4, [esp+64]
-        movups xmm5, [esp+80]
-        movups xmm6, [esp+96]
-        movups xmm7, [esp+112]
-        add    esp, 128
-        popad
-        mulss  xmm2, dword ptr [g_axeDmgFactor]
-        jmp    dword ptr [g_axeDmgResume]
-    }
-}
 // ---- Axe throw aim tilt ----
 // While charging an axe throw, tilt the axe toward where it will go: up held alone = upright, up + left/right = 45 up, down held =
 // 45 down, neither = level. It uses the bow's Weapon::aimAngle (+0x2d0, degrees, positive = up), which
@@ -5916,10 +6387,11 @@ static void install_axe_tree() {
         axe_patch("hud: momentum icon (start)", 0x0030eb71, hb, sizeof(hb), 0xE9, (void*)&det_hudStatusBegin);
         axe_patch("hud: momentum icon (end)",   0x0030ec91, he, sizeof(he), 0xE9, (void*)&det_hudStatusEnd);
     }
-    {   // level 1's +25%: mulss xmm2,[edi+0x360] in Weapon::doCollision
-        const uint8_t pd[8] = {0xF3,0x0F,0x59,0x97,0x60,0x03,0x00,0x00};
-        g_axeDmgResume = g_base + 0x003fa7ff;
-        axe_patch("doCollision: axe level 1 damage", 0x003fa7f7, pd, sizeof(pd), 0xE9, (void*)&det_axeDamage);
+    {   // Momentum count in the synced player state (momentum_state_out / momentum_state_in)
+        const uint8_t sp[5] = {0x55, 0x8B, 0xEC, 0x6A, 0xFF};
+        g_playerGetStateTramp = install_detour(0x002ee2c0, (void*)&det_playerGetState, 5, sp, 5);
+        g_playerSetStateTramp = install_detour(0x002eef10, (void*)&det_playerSetState, 5, sp, 5);
+        logmsg("[brutalist] momentum state sync %s", g_playerGetStateTramp && g_playerSetStateTramp ? "installed" : "FAILED");
     }
     {   // charge bonus in Weapon::doCollision (absolute operand, so relocated)
         uint8_t pc[8] = {0xF3,0x0F,0x59,0x0D,0,0,0,0};
@@ -6151,6 +6623,47 @@ static void zero_random_wand_charges(void* player) {
     }
     if (zeroed) logmsg("[randwpn] zeroed %d random-class wand(s) for player=%p", zeroed, player);
 }
+// The Woodsman's background: a pair of gloves with Explosion Master (as the game builds an attribute:
+// operator new(0xd0), ItemAttribute(type) with xmm2 = 0, Item::addAttribute), put on.
+__declspec(naked) static void* make_attribute(void* mem, int type) {
+    __asm {
+        push ebp
+        mov  ebp, esp
+        xorps xmm2, xmm2
+        push dword ptr [ebp+0x0c]
+        mov  ecx, dword ptr [ebp+0x08]
+        mov  eax, g_base
+        add  eax, 0x00235fb0          // ItemAttribute::ItemAttribute(type) (thiscall, ret 4)
+        call eax
+        pop  ebp
+        ret
+    }
+}
+static void give_explosion_gloves(void* player) {
+    if (!player || !g_makeItemVA || !g_invPickUpVA || !g_addEntityTramp || !g_invEquipVA || !g_opnew) return;
+    uint8_t* p = static_cast<uint8_t*>(player);
+    void* level = *reinterpret_cast<void**>(p + OFF_ENT_LEVEL2);
+    if (!level) return;
+    float x = *reinterpret_cast<float*>(p + OFF_ENT_X2), y = *reinterpret_cast<float*>(p + OFF_ENT_Y2);
+    int type = 187, count = 1;                                   // ITEMTYPE_GLOVES
+    void* sp[2] = {nullptr, nullptr};
+    make_item_shared(&sp, &level, &x, &y, &type, &count);
+    if (!sp[0]) return;
+    void* mem = g_opnew(0xd0);
+    if (mem) {
+        void* attr = make_attribute(mem, ATTRIBUTE_EXPLOSION_AFFINITY);
+        typedef void (__thiscall *addAttr_t)(void* item, void* attr);
+        reinterpret_cast<addAttr_t>(g_base + 0x002234c0)(sp[0], attr);   // Item::addAttribute
+    }
+    g_addEntityTramp(level, &sp);
+    void* inv = p + OFF_PLAYER_INVENTORY;
+    if (sp[1]) InterlockedIncrement(reinterpret_cast<long*>(static_cast<uint8_t*>(sp[1]) + 4));
+    inv_pickup_item(inv, sp[0], sp[1]);
+    if (sp[1]) InterlockedIncrement(reinterpret_cast<long*>(static_cast<uint8_t*>(sp[1]) + 4));
+    inv_equip_item(inv, sp[0], sp[1]);
+    release_shared_block(sp[1]);
+    logmsg("[woodsman] background: gave + equipped Explosion Master gloves to player=%p", player);
+}
 static void __cdecl det_setStartingItems(void* spPtr, void* spCtrl) {
     g_setStartItemsTramp(spPtr, spCtrl);           // run the normal class loadout first
     // (the Woodsman's axe comes from the stock default case, patched from the club in install_woodsman_axe_kit)
@@ -6164,6 +6677,9 @@ static void __cdecl det_setStartingItems(void* spPtr, void* spCtrl) {
     if (spPtr && (*reinterpret_cast<int*>(reinterpret_cast<uint8_t*>(spPtr) + 0x34c) == CLASS_WOODSMAN
                   || (randomChar && g_randWeaponMatch && has_affinity(spPtr, 27))))
         give_small_bombs(spPtr);
+    if (spPtr && *reinterpret_cast<int*>(static_cast<uint8_t*>(spPtr) + 0x34c) == CLASS_WOODSMAN
+        && *(static_cast<uint8_t*>(spPtr) + 0x824) == BG_WOODSMAN)
+        give_explosion_gloves(spPtr);
     zero_random_wand_charges(spPtr);
     give_debug_start_kit(spPtr);
 }
@@ -6391,6 +6907,35 @@ static void test_frame(void*) {}
 static void test_harness_install() {}
 #endif
 
+#ifdef VULTRA_VANILLA_PROBE
+// Dev probe build (build2.bat probe): no mod features, only logging. Player::stopBearStomp and NetEvent::step
+// (each event once) are logged, to see where a stomp's screen shake and sound happen in the base game.
+static bearStomp_t g_probeStompTramp = nullptr;
+static void __fastcall probe_stopBearStomp(void* self, void* edx, int landed) {
+    uint8_t* p = static_cast<uint8_t*>(self);
+    logmsg("[probe] stopBearStomp p=%p landed=%d a2=%d stomp=%d host=%d", p, landed & 0xff, p[0xa2], p[0x990],
+           GetTickCount() - g_lastServerStep < 500);
+    g_probeStompTramp(self, edx, landed);
+}
+static void* g_probeEvTramp = nullptr;
+static thread_local const void* g_probeEvSeen[64];
+static thread_local int g_probeEvN = 0;
+static void __cdecl probe_event_note(const uint8_t* e) {
+    for (int i = 0; i < 64; i++) if (g_probeEvSeen[i] == e) return;
+    g_probeEvSeen[g_probeEvN++ & 63] = e;
+    logmsg("[probe] NetEvent %p type %d a2=%d target %d thread %lu", e, e[0x1f8], e[0xa2], e[0x221], GetCurrentThreadId());
+}
+__declspec(naked) static void probe_netEventStep() {
+    __asm {
+        pushad
+        push ecx
+        call probe_event_note
+        add  esp, 4
+        popad
+        jmp  dword ptr [g_probeEvTramp]
+    }
+}
+#endif
 static bool install_hook() {
     char exePath[MAX_PATH]; GetModuleFileNameA(GetModuleHandleW(nullptr), exePath, MAX_PATH);
     const char* exeName = strrchr(exePath, '\\'); exeName = exeName ? exeName + 1 : exePath;
@@ -6398,6 +6943,21 @@ static bool install_hook() {
     g_base = reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr));
     if (!g_base) return false;
     load_config();
+#ifdef VULTRA_VANILLA_PROBE
+    {
+        const uint8_t step_pro[] = {0x55, 0x8B, 0xEC, 0x6A, 0xFF};
+        g_stepTramp = reinterpret_cast<clientStep_t>(install_detour(RVA_CLIENT_STEP, (void*)&det_step, 5, step_pro, 5));
+        if (g_stepTramp) test_harness_install();
+        g_serverStepTramp = reinterpret_cast<serverStep_t>(install_detour(RVA_SERVER_STEP, (void*)&det_server_step, 5, step_pro, 5));
+        const uint8_t pro[] = {0x55, 0x8B, 0xEC, 0x6A, 0xFF};
+        g_probeStompTramp = reinterpret_cast<bearStomp_t>(install_detour(0x00301220, (void*)&probe_stopBearStomp, 5, pro, 5));
+        const uint8_t ev_pro[] = {0x55, 0x8B, 0xEC, 0x83, 0xE4, 0xF8};
+        g_probeEvTramp = install_detour(0x000b68d0, (void*)&probe_netEventStep, 6, ev_pro, 6);
+        logmsg("[probe] vanilla probe build: step %d server %d stomp %d event %d", g_stepTramp != nullptr,
+               g_serverStepTramp != nullptr, g_probeStompTramp != nullptr, g_probeEvTramp != nullptr);
+        return true;
+    }
+#endif
     // Redirect the spellbook-generation roll to our pool picker. We intentionally do NOT
     // hook setSkill's entry, so load/pickup re-apply a book's stored skill unchanged.
     g_realSetSkill = g_base + RVA_SET_SKILL;
@@ -6440,6 +7000,11 @@ static bool install_hook() {
     const uint8_t bg_pro[] = {0x55, 0x8B, 0xEC, 0x6A, 0xFF};
     g_origGetBg = install_detour(RVA_GET_AVAIL_BG, (void*)&det_getBg, 5, bg_pro, 5);
     logmsg("[vultra] wisp curse hook %s", g_origGetBg ? "installed" : "FAILED");
+    {
+        const uint8_t un_pro[6] = {0x53, 0x8B, 0xDC, 0x83, 0xEC, 0x08};   // push ebx; mov ebx,esp; sub esp,8
+        g_bgUpdateNameTramp = reinterpret_cast<bgUpdateName_t>(install_detour(0x000f9890, (void*)&det_bgUpdateName, 6, un_pro, 6));
+        logmsg("[woodsman] background name hook %s", g_bgUpdateNameTramp ? "installed" : "FAILED");
+    }
 
     // Wisp Curse force-for-everyone: replace the per-floor flag-init store in loadNextLevel.
     {
